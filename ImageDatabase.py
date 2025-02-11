@@ -29,45 +29,68 @@ def choose_folder():
 
 # Function to convert wildcard queries to regex patterns
 def wildcard_to_regex(query):
-    query = query.lower()
-    query = query.replace("*", ".*")  # Convert * to regex equivalent
-    return query
+    return query.replace("*", ".*")  # Convert * to regex equivalent
 
-# Function to parse query into logical components
+# Function to parse logical search queries
 def parse_query(query):
     """
-    Extracts phrases in quotes and individual words while keeping logical operators.
+    Extracts phrases in quotes, field-specific searches, and logical operators.
     Example:
-    'Exposure Value' AND ISO 100  -> ['"Exposure Value"', 'AND', 'ISO', '100']
+    'Copyright: John Doe AND ISO: 1600' -> [('Copyright', 'John Doe'), 'AND', ('ISO', '1600')]
     """
-    pattern = r'"([^"]+)"|\S+'  # Matches quoted phrases OR single words
-    return re.findall(pattern, query)
+    field_pattern = r'(\w+)\s*:\s*"([^"]+)"|(\w+)\s*:\s*([\S]+)'  # Matches field:value or field:"value"
+    logical_pattern = r'\b(AND|OR|NOT)\b'  # Matches logical operators
+    matches = re.findall(field_pattern, query, re.IGNORECASE)
 
-# Function to evaluate complex search queries with phrases and wildcards
-def match_search_terms(metadata_text, query):
-    metadata_text = metadata_text.lower()
-    terms = parse_query(query)
+    parsed_terms = []
+    for match in matches:
+        field = match[0] or match[2]
+        value = match[1] or match[3]
+        parsed_terms.append((field.lower(), wildcard_to_regex(value.lower())))
 
-    if " and " in query.lower():
-        subqueries = [wildcard_to_regex(term) for term in terms if term.lower() != "and"]
-        return all(re.search(term, metadata_text) for term in subqueries)
+    # Find logical operators
+    operators = re.findall(logical_pattern, query, re.IGNORECASE)
 
-    elif " or " in query.lower():
-        subqueries = [wildcard_to_regex(term) for term in terms if term.lower() != "or"]
-        return any(re.search(term, metadata_text) for term in subqueries)
+    return parsed_terms, operators
 
-    elif " not " in query.lower():
-        parts = query.lower().split(" not ")
-        include_pattern = wildcard_to_regex(parts[0].strip())
-        exclude_pattern = wildcard_to_regex(parts[1].strip())
-        return re.search(include_pattern, metadata_text) and not re.search(exclude_pattern, metadata_text)
+# Function to evaluate complex field-specific search queries
+def match_search_terms(metadata, query):
+    metadata = {k.lower(): v.lower() for k, v in metadata.items()}  # Normalize metadata keys/values
+    parsed_terms, operators = parse_query(query)
 
+    if not parsed_terms:
+        return False  # No valid search terms found
+
+    results = []
+    
+    for field, pattern in parsed_terms:
+        if field in metadata:
+            match_found = re.search(pattern, metadata[field]) is not None
+        else:
+            match_found = False  # Field not in metadata
+
+        results.append(match_found)
+
+    # Apply logical operations (AND, OR, NOT)
+    if "AND" in operators:
+        return all(results)
+    elif "OR" in operators:
+        return any(results)
+    elif "NOT" in operators:
+        return results[0] and not results[1]  # Assumes only one NOT condition for simplicity
     else:
-        # If no operators, check for any match
-        subqueries = [wildcard_to_regex(term) for term in terms]
-        return any(re.search(term, metadata_text) for term in subqueries)
+        return any(results)  # Default behavior if no operators
 
-# Function to scan images in folder and search metadata
+# Function to recursively search for images in all subfolders
+def search_images_in_folder(folder):
+    image_files = []
+    for root, _, files in os.walk(folder):  # Recursively walks through all subdirectories
+        for file in files:
+            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.tiff', '.bmp')):
+                image_files.append(os.path.join(root, file))
+    return image_files
+
+# Function to scan images in folder (and subfolders) and search metadata
 def search_metadata():
     if not selected_folder:
         folder_label.config(text="Please choose a folder first!", foreground="red")
@@ -78,17 +101,15 @@ def search_metadata():
     global image_matches
     image_matches = []  # Store image paths for reference
 
-    for filename in os.listdir(selected_folder):
-        if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.tiff', '.bmp')):
-            image_path = os.path.join(selected_folder, filename)
-            metadata = extract_metadata(image_path)
+    image_files = search_images_in_folder(selected_folder)  # Get images from all subfolders
 
-            metadata_text = " ".join(metadata.values()).lower()
+    for image_path in image_files:
+        metadata = extract_metadata(image_path)
 
-            if match_search_terms(metadata_text, search_query):
-                display_text = f"{filename} - {search_query} found"
-                results_list.insert(tk.END, display_text)
-                image_matches.append(image_path)
+        if match_search_terms(metadata, search_query):
+            display_text = f"{os.path.relpath(image_path, selected_folder)} - Match found"
+            results_list.insert(tk.END, display_text)
+            image_matches.append(image_path)
 
 # Function to open image on click
 def open_selected_image(event):
@@ -100,7 +121,7 @@ def open_selected_image(event):
 # GUI Setup
 root = tk.Tk()
 root.title("Advanced Image Metadata Search")
-root.geometry("650x450")
+root.geometry("700x500")
 
 frame = ttk.Frame(root, padding=10)
 frame.pack(fill=tk.BOTH, expand=True)
@@ -113,7 +134,7 @@ folder_label = ttk.Label(frame, text="No folder selected", foreground="blue")
 folder_label.pack(pady=5)
 
 # Search Input
-ttk.Label(frame, text="Search Term: (Use AND, OR, NOT, *, or quotes for phrases)").pack(pady=5)
+ttk.Label(frame, text="Search Term: (Field:Value, AND, OR, NOT, *, quotes for phrases)").pack(pady=5)
 search_entry = ttk.Entry(frame, width=50)
 search_entry.pack(pady=5)
 
@@ -128,7 +149,7 @@ ttk.Label(frame, text="Results (Double-click to Open Image):").pack(pady=5)
 list_frame = ttk.Frame(frame)
 list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-results_list = Listbox(list_frame, width=90, height=15)
+results_list = Listbox(list_frame, width=100, height=20)
 results_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
 scrollbar = Scrollbar(list_frame, orient="vertical", command=results_list.yview)
