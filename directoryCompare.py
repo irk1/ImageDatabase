@@ -53,162 +53,142 @@ def list_files(source, base_temp_dir=None, progress_callback=None):
 class CompareApp:
     def __init__(self, root):
         self.root = root
-        root.title("Compare by Filename or Hash")
-
-        self.src1 = None
-        self.src2 = None
+        root.title("Compare Images in Folder or .7z Archive")
+        self.src1 = self.src2 = ""
         self.temp_dirs = []
 
-        # UI Elements
-        tk.Button(root, text="Select Source 1 (Folder or .7z)", command=self.select_src1).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        self.src1_label = tk.Label(root, text="No source 1 selected", anchor="w", width=70)
-        self.src1_label.grid(row=0, column=1, padx=5, pady=5)
+        tk.Button(root, text="Select Source 1", command=self.load_src1).grid(row=0, column=0, padx=5, pady=5)
+        self.src1_label = tk.Label(root, text="Not selected", anchor="w", width=60)
+        self.src1_label.grid(row=0, column=1)
 
-        tk.Button(root, text="Select Source 2 (Folder or .7z)", command=self.select_src2).grid(row=1, column=0, padx=5, pady=5, sticky="ew")
-        self.src2_label = tk.Label(root, text="No source 2 selected", anchor="w", width=70)
-        self.src2_label.grid(row=1, column=1, padx=5, pady=5)
+        tk.Button(root, text="Select Source 2", command=self.load_src2).grid(row=1, column=0, padx=5, pady=5)
+        self.src2_label = tk.Label(root, text="Not selected", anchor="w", width=60)
+        self.src2_label.grid(row=1, column=1)
 
         btn_frame = tk.Frame(root)
         btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
-        tk.Button(btn_frame, text="Compare by Filename", command=lambda: self.start_thread(self.compare_by_name)).grid(row=0, column=0, padx=10)
-        tk.Button(btn_frame, text="Compare by Hash", command=lambda: self.start_thread(self.compare_by_hash)).grid(row=0, column=1, padx=10)
+        tk.Button(btn_frame, text="Compare by Filename", command=lambda: self.run_thread(self.compare_by_name)).grid(row=0, column=0, padx=10)
+        tk.Button(btn_frame, text="Compare by Hash", command=lambda: self.run_thread(self.compare_by_hash)).grid(row=0, column=1, padx=10)
 
-        self.progress = ttk.Progressbar(root, orient="horizontal", length=450, mode="determinate")
+        self.progress = ttk.Progressbar(root, orient="horizontal", length=400, mode="determinate")
         self.progress.grid(row=3, column=0, columnspan=2, pady=5)
-
         self.status = tk.Label(root, text="", anchor="w")
         self.status.grid(row=4, column=0, columnspan=2)
 
-    def select_src1(self):
-        path = filedialog.askopenfilename(title="Select Source 1: Folder or .7z archive",
-                                          filetypes=[("7z archives", "*.7z")])
-        if not path:
-            path = filedialog.askdirectory(title="Or select Source 1 folder")
+    def load_src1(self):
+        path = filedialog.askopenfilename(title="Select Folder or .7z File") or filedialog.askdirectory()
         if path:
             self.src1 = path
             self.src1_label.config(text=path)
 
-    def select_src2(self):
-        path = filedialog.askopenfilename(title="Select Source 2: Folder or .7z archive",
-                                          filetypes=[("7z archives", "*.7z")])
-        if not path:
-            path = filedialog.askdirectory(title="Or select Source 2 folder")
+    def load_src2(self):
+        path = filedialog.askopenfilename(title="Select Folder or .7z File") or filedialog.askdirectory()
         if path:
             self.src2 = path
             self.src2_label.config(text=path)
 
     def update_progress(self, current, total, label="Processing"):
-        def _update():
-            self.progress["maximum"] = total
-            self.progress["value"] = current
-            self.status.config(text=f"{label}: {current}/{total}")
-        self.root.after(0, _update)
+        self.root.after(0, lambda: self._update_progress(current, total, label))
 
-    def start_thread(self, func):
+    def _update_progress(self, current, total, label):
+        self.progress["maximum"] = total
+        self.progress["value"] = current
+        self.status.config(text=f"{label}: {current}/{total}")
+
+    def run_thread(self, comparison_func):
         if not self.src1 or not self.src2:
-            messagebox.showwarning("Warning", "Please select both sources before comparing.")
+            messagebox.showwarning("Error", "Please select both sources.")
             return
+        self.status.config(text="Starting...")
         self.progress["value"] = 0
-        self.status.config(text="Starting comparison...")
-        threading.Thread(target=func, daemon=True).start()
+        threading.Thread(target=lambda: self.threaded_compare(comparison_func), daemon=True).start()
+
+    def threaded_compare(self, comparison_func):
+        try:
+            comparison_func()
+        except Exception as e:
+            self.root.after(0, lambda e=e: messagebox.showerror("Error", str(e)))
 
     def compare_by_name(self):
-        self.status.config(text="Listing files in Source 1...")
-        files1, tmp1 = list_files(self.src1, tempfile.gettempdir(), lambda i,t: self.update_progress(i, t, "Listing Src1"))
-        self.status.config(text="Listing files in Source 2...")
-        files2, tmp2 = list_files(self.src2, tempfile.gettempdir(), lambda i,t: self.update_progress(i, t, "Listing Src2"))
+        self.update_progress(0, 1, "Listing Src1")
+        files1, tmp1 = list_files(self.src1, tempfile.gettempdir(), lambda i, t: self.update_progress(i, t, "Listing Src1"))
+        self.update_progress(0, 1, "Listing Src2")
+        files2, tmp2 = list_files(self.src2, tempfile.gettempdir(), lambda i, t: self.update_progress(i, t, "Listing Src2"))
         if tmp1: self.temp_dirs.append(tmp1)
         if tmp2: self.temp_dirs.append(tmp2)
 
-        set1, set2 = set(files1.keys()), set(files2.keys())
+        set1, set2 = set(files1), set(files2)
         only1 = sorted(set1 - set2)
         only2 = sorted(set2 - set1)
-
-        self.show_results(only1, only2, files1, files2, "Filename Comparison")
-        self.update_progress(0, 0, "Comparison done.")
+        self.show_results(only1, only2, files1, files2, "Filename comparison")
 
     def compare_by_hash(self):
-        self.status.config(text="Listing files in Source 1...")
-        files1, tmp1 = list_files(self.src1, tempfile.gettempdir())
-        self.status.config(text="Listing files in Source 2...")
-        files2, tmp2 = list_files(self.src2, tempfile.gettempdir())
+        self.update_progress(0, 1, "Listing Src1")
+        f1, tmp1 = list_files(self.src1, tempfile.gettempdir(), lambda i, t: self.update_progress(i, t, "Listing Src1"))
+        self.update_progress(0, 1, "Listing Src2")
+        f2, tmp2 = list_files(self.src2, tempfile.gettempdir(), lambda i, t: self.update_progress(i, t, "Listing Src2"))
         if tmp1: self.temp_dirs.append(tmp1)
         if tmp2: self.temp_dirs.append(tmp2)
 
-        self.status.config(text="Hashing files in Source 2...")
+        self.status.config(text="Hashing Source 2...")
         hashes2 = {}
-        all2 = list(files2.items())
-        total2 = len(all2)
+        all2 = list(f2.items())
         for idx, (rel, full) in enumerate(all2, 1):
             h = compute_hash(full)
             hashes2[h] = rel
-            self.update_progress(idx, total2, "Hashing Src2")
+            self.update_progress(idx, len(all2), "Hashing Src2")
 
-        self.status.config(text="Hashing files in Source 1...")
+        self.status.config(text="Hashing Source 1...")
         only1 = []
         only2 = set(hashes2.values())
-        all1 = list(files1.items())
-        total1 = len(all1)
+        all1 = list(f1.items())
         for idx, (rel, full) in enumerate(all1, 1):
             h = compute_hash(full)
             if h in hashes2:
                 only2.discard(hashes2[h])
             else:
                 only1.append(rel)
-            self.update_progress(idx, total1, "Hashing Src1")
+            self.update_progress(idx, len(all1), "Hashing Src1")
 
         only2 = sorted(only2)
-        self.show_results(only1, only2, files1, files2, "Hash Comparison")
-        self.update_progress(0, 0, "Comparison done.")
+        self.show_results(only1, only2, f1, f2, "Hash comparison")
 
     def show_results(self, only1, only2, map1, map2, title):
-        def copy_files(selected, source_map, dest_path):
-            count = 0
-            for rel_path in selected:
-                src_file = source_map[rel_path]
-                dst_file = os.path.join(dest_path, rel_path)
-                os.makedirs(os.path.dirname(dst_file), exist_ok=True)
-                shutil.copy2(src_file, dst_file)
-                count += 1
-            messagebox.showinfo("Copy Complete", f"Copied {count} files.")
+        self.root.after(0, lambda: self._show_results(only1, only2, map1, map2, title))
 
-        def do_copy_left():
-            selected = listbox_left.curselection()
-            if not selected:
-                messagebox.showwarning("No selection", "Select files to copy to Source 1")
-                return
-            files = [listbox_left.get(i) for i in selected]
-            copy_files(files, map2, self.src1)
-
-        def do_copy_right():
-            selected = listbox_right.curselection()
-            if not selected:
-                messagebox.showwarning("No selection", "Select files to copy to Source 2")
-                return
-            files = [listbox_right.get(i) for i in selected]
-            copy_files(files, map1, self.src2)
-
+    def _show_results(self, only1, only2, map1, map2, title):
+        self.progress["value"] = 0
+        self.status.config(text=title + " done.")
         win = tk.Toplevel(self.root)
-        win.title(f"Results - {title}")
+        win.title(f"Results: {title}")
 
-        tk.Label(win, text=f"Only in Source 1:\n{self.src1}").grid(row=0, column=0)
-        tk.Label(win, text=f"Only in Source 2:\n{self.src2}").grid(row=0, column=2)
+        frame = tk.Frame(win)
+        frame.pack(padx=10, pady=10)
 
-        listbox_left = tk.Listbox(win, selectmode=tk.EXTENDED, width=50, height=20)
-        listbox_left.grid(row=1, column=0, padx=5, pady=5)
-        for f in only1:
-            listbox_left.insert(tk.END, f)
+        tk.Label(frame, text=f"Only in Source 1\n({self.src1})", anchor="center").grid(row=0, column=0)
+        tk.Label(frame, text=f"Only in Source 2\n({self.src2})", anchor="center").grid(row=0, column=1)
 
-        listbox_right = tk.Listbox(win, selectmode=tk.EXTENDED, width=50, height=20)
-        listbox_right.grid(row=1, column=2, padx=5, pady=5)
-        for f in only2:
-            listbox_right.insert(tk.END, f)
+        lb1 = tk.Listbox(frame, selectmode=tk.MULTIPLE, width=60, height=20)
+        lb1.grid(row=1, column=0, padx=5)
+        for item in only1:
+            lb1.insert(tk.END, item)
 
-        btn_frame = tk.Frame(win)
-        btn_frame.grid(row=1, column=1, padx=5, pady=5)
+        lb2 = tk.Listbox(frame, selectmode=tk.MULTIPLE, width=60, height=20)
+        lb2.grid(row=1, column=1, padx=5)
+        for item in only2:
+            lb2.insert(tk.END, item)
 
-        tk.Button(btn_frame, text="Copy →", command=do_copy_right, width=10).pack(pady=10)
-        tk.Button(btn_frame, text="← Copy", command=do_copy_left, width=10).pack(pady=10)
+        def do_copy(lb, src_map, dst):
+            sel = [lb.get(i) for i in lb.curselection()]
+            for rel in sel:
+                srcp = src_map[rel]
+                dstp = os.path.join(dst, rel)
+                os.makedirs(os.path.dirname(dstp), exist_ok=True)
+                shutil.copy2(srcp, dstp)
+            messagebox.showinfo("Copied", f"Copied {len(sel)} files.")
+
+        tk.Button(frame, text="Copy →", command=lambda: do_copy(lb1, map1, self.src2)).grid(row=2, column=0, pady=10)
+        tk.Button(frame, text="← Copy", command=lambda: do_copy(lb2, map2, self.src1)).grid(row=2, column=1, pady=10)
 
     def __del__(self):
         for d in self.temp_dirs:
@@ -216,6 +196,5 @@ class CompareApp:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    root.geometry("700x250")
-    app = CompareApp(root)
+    CompareApp(root)
     root.mainloop()
