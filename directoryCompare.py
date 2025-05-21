@@ -1,200 +1,184 @@
 import os
 import hashlib
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-import py7zr
 import shutil
 import tempfile
 import threading
+import concurrent.futures
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from tkinterdnd2 import DND_FILES, TkinterDnD
+import py7zr
 
-def compute_hash(filepath):
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
+
+def is_image_file(filename):
+    return os.path.splitext(filename)[1].lower() in IMAGE_EXTENSIONS
+
+def hash_file(fp):
     h = hashlib.sha256()
-    with open(filepath, 'rb') as f:
-        while chunk := f.read(8192):
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
 
-def extract_7z_flattened(archive_path, base_temp_dir, progress_callback=None):
-    temp_dir = tempfile.mkdtemp(dir=base_temp_dir)
-    with py7zr.SevenZipFile(archive_path, mode='r') as archive:
-        archive.extractall(path=temp_dir)
+def list_files(path, temp_dirs, include_all=False):
+    files = {}
+    if os.path.isdir(path):
+        for root, _, names in os.walk(path):
+            for n in names:
+                if include_all or is_image_file(n):
+                    full = os.path.join(root, n)
+                    rel = os.path.relpath(full, path).replace("\\", "/")
+                    files[rel] = full
+    elif path.lower().endswith(".7z"):
+        tmp = tempfile.mkdtemp()
+        temp_dirs.append(tmp)
+        with py7zr.SevenZipFile(path, "r") as a:
+            a.extractall(path=tmp)
+        return list_files(tmp, temp_dirs, include_all)
+    return files
 
-    all_files = []
-    for root, _, files in os.walk(temp_dir):
-        for file in files:
-            all_files.append(os.path.join(root, file))
+def compare_by_filename(f1, f2):
+    m1 = {p: f2[p] for p in f2 if p not in f1}
+    m2 = {p: f1[p] for p in f1 if p not in f2}
+    return m1, m2
 
-    total = len(all_files)
-    file_dict = {}
-    for idx, full_path in enumerate(all_files, 1):
-        rel = os.path.relpath(full_path, temp_dir)
-        file_dict[rel] = full_path
-        if progress_callback:
-            progress_callback(idx, total)
-    return file_dict, temp_dir
+def compare_by_hash(f1, f2, progress=None):
+    # Hash all files in source1
+    hashes1 = {}
+    items1 = list(f1.items())
+    total1 = len(items1)
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        futures = {ex.submit(hash_file, fp): rel for rel, fp in items1}
+        for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+            rel = futures[fut]
+            h = fut.result()
+            hashes1.setdefault(h, []).append(rel)
+            if progress: progress("Hashing Src1", i, total1)
 
-def list_files(source, base_temp_dir=None, progress_callback=None):
-    if source.lower().endswith(".7z"):
-        return extract_7z_flattened(source, base_temp_dir, progress_callback)
-    else:
-        all_files = []
-        for root, _, files in os.walk(source):
-            for file in files:
-                all_files.append(os.path.join(root, file))
-        total = len(all_files)
-        file_dict = {}
-        for idx, full_path in enumerate(all_files, 1):
-            rel = os.path.relpath(full_path, source)
-            file_dict[rel] = full_path
-            if progress_callback:
-                progress_callback(idx, total)
-        return file_dict, None
+    # Hash all files in source2
+    hashes2 = {}
+    items2 = list(f2.items())
+    total2 = len(items2)
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        futures = {ex.submit(hash_file, fp): rel for rel, fp in items2}
+        for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+            rel = futures[fut]
+            h = fut.result()
+            hashes2.setdefault(h, []).append(rel)
+            if progress: progress("Hashing Src2", i, total2)
+
+    # Find hashes only in one
+    only_hash1 = set(hashes1) - set(hashes2)
+    only_hash2 = set(hashes2) - set(hashes1)
+
+    # Map back to rel paths
+    m1 = {rel: f1[rel] for h in only_hash1 for rel in hashes1[h]}
+    m2 = {rel: f2[rel] for h in only_hash2 for rel in hashes2[h]}
+    return m1, m2
 
 class CompareApp:
     def __init__(self, root):
         self.root = root
-        root.title("Compare Images in Folder or .7z Archive")
+        root.title("Image Compare Tool (.7z + Folders)")
         self.src1 = self.src2 = ""
         self.temp_dirs = []
 
-        tk.Button(root, text="Select Source 1", command=self.load_src1).grid(row=0, column=0, padx=5, pady=5)
-        self.src1_label = tk.Label(root, text="Not selected", anchor="w", width=60)
-        self.src1_label.grid(row=0, column=1)
+        tk.Button(root, text="Select Source 1", command=self.load1).grid(row=0,column=0,padx=5,pady=5)
+        self.l1 = tk.Label(root, text="Drop here for Source 1", width=60, relief="sunken", anchor="w")
+        self.l1.grid(row=0,column=1,padx=5)
+        self.l1.drop_target_register(DND_FILES); self.l1.dnd_bind("<<Drop>>", self.drop1)
 
-        tk.Button(root, text="Select Source 2", command=self.load_src2).grid(row=1, column=0, padx=5, pady=5)
-        self.src2_label = tk.Label(root, text="Not selected", anchor="w", width=60)
-        self.src2_label.grid(row=1, column=1)
+        tk.Button(root, text="Select Source 2", command=self.load2).grid(row=1,column=0,padx=5,pady=5)
+        self.l2 = tk.Label(root, text="Drop here for Source 2", width=60, relief="sunken", anchor="w")
+        self.l2.grid(row=1,column=1,padx=5)
+        self.l2.drop_target_register(DND_FILES); self.l2.dnd_bind("<<Drop>>", self.drop2)
 
-        btn_frame = tk.Frame(root)
-        btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
-        tk.Button(btn_frame, text="Compare by Filename", command=lambda: self.run_thread(self.compare_by_name)).grid(row=0, column=0, padx=10)
-        tk.Button(btn_frame, text="Compare by Hash", command=lambda: self.run_thread(self.compare_by_hash)).grid(row=0, column=1, padx=10)
+        f = tk.Frame(root); f.grid(row=2,column=0,columnspan=2,pady=10)
+        tk.Button(f, text="Compare by Filename", command=lambda: self.run(self._cmp_name)).grid(row=0,column=0,padx=10)
+        tk.Button(f, text="Compare by Hash",     command=lambda: self.run(self._cmp_hash)).grid(row=0,column=1,padx=10)
 
-        self.progress = ttk.Progressbar(root, orient="horizontal", length=400, mode="determinate")
-        self.progress.grid(row=3, column=0, columnspan=2, pady=5)
-        self.status = tk.Label(root, text="", anchor="w")
-        self.status.grid(row=4, column=0, columnspan=2)
+        self.pb = ttk.Progressbar(root, orient="horizontal", length=400, mode="determinate")
+        self.pb.grid(row=3,column=0,columnspan=2,pady=5)
+        self.st = tk.Label(root, text="", anchor="w")
+        self.st.grid(row=4,column=0,columnspan=2)
 
-    def load_src1(self):
-        path = filedialog.askopenfilename(title="Select Folder or .7z File") or filedialog.askdirectory()
-        if path:
-            self.src1 = path
-            self.src1_label.config(text=path)
+    def load1(self):
+        p = filedialog.askopenfilename(title="Src1") or filedialog.askdirectory(title="Src1")
+        if p: self.src1, self.l1["text"] = p, p
+    def load2(self):
+        p = filedialog.askopenfilename(title="Src2") or filedialog.askdirectory(title="Src2")
+        if p: self.src2, self.l2["text"] = p, p
+    def drop1(self,e):
+        p=e.data.strip("{}"); 
+        if os.path.exists(p): self.src1, self.l1["text"]=p,p
+    def drop2(self,e):
+        p=e.data.strip("{}"); 
+        if os.path.exists(p): self.src2, self.l2["text"]=p,p
 
-    def load_src2(self):
-        path = filedialog.askopenfilename(title="Select Folder or .7z File") or filedialog.askdirectory()
-        if path:
-            self.src2 = path
-            self.src2_label.config(text=path)
+    def update(self, tag, i, total):
+        self.pb["maximum"], self.pb["value"] = total, i
+        self.st["text"] = f"{tag}: {i}/{total}"
+        self.root.update_idletasks()
 
-    def update_progress(self, current, total, label="Processing"):
-        self.root.after(0, lambda: self._update_progress(current, total, label))
-
-    def _update_progress(self, current, total, label):
-        self.progress["maximum"] = total
-        self.progress["value"] = current
-        self.status.config(text=f"{label}: {current}/{total}")
-
-    def run_thread(self, comparison_func):
+    def run(self, func):
         if not self.src1 or not self.src2:
-            messagebox.showwarning("Error", "Please select both sources.")
-            return
-        self.status.config(text="Starting...")
-        self.progress["value"] = 0
-        threading.Thread(target=lambda: self.threaded_compare(comparison_func), daemon=True).start()
+            messagebox.showwarning("Error","Select both sources."); return
+        self.pb["value"] = 0
+        self.st["text"] = "Starting..."
+        threading.Thread(target=func, daemon=True).start()
 
-    def threaded_compare(self, comparison_func):
-        try:
-            comparison_func()
-        except Exception as e:
-            self.root.after(0, lambda e=e: messagebox.showerror("Error", str(e)))
+    def _cmp_name(self):
+        f1 = list_files(self.src1, self.temp_dirs, include_all=False)
+        f2 = list_files(self.src2, self.temp_dirs, include_all=False)
+        m1, m2 = compare_by_filename(f1, f2)
+        self._show(f1, f2, m1, m2)
 
-    def compare_by_name(self):
-        self.update_progress(0, 1, "Listing Src1")
-        files1, tmp1 = list_files(self.src1, tempfile.gettempdir(), lambda i, t: self.update_progress(i, t, "Listing Src1"))
-        self.update_progress(0, 1, "Listing Src2")
-        files2, tmp2 = list_files(self.src2, tempfile.gettempdir(), lambda i, t: self.update_progress(i, t, "Listing Src2"))
-        if tmp1: self.temp_dirs.append(tmp1)
-        if tmp2: self.temp_dirs.append(tmp2)
+    def _cmp_hash(self):
+        f1 = list_files(self.src1, self.temp_dirs, include_all=True)  # all files hashed
+        f2 = list_files(self.src2, self.temp_dirs, include_all=True)
+        m1, m2 = compare_by_hash(f1, f2, self.update)
+        self._show(f1, f2, m1, m2)
 
-        set1, set2 = set(files1), set(files2)
-        only1 = sorted(set1 - set2)
-        only2 = sorted(set2 - set1)
-        self.show_results(only1, only2, files1, files2, "Filename comparison")
+    def _show(self, f1, f2, m1, m2):
+        self.pb["value"]=0; self.st["text"]="Done"
+        w=tk.Toplevel(self.root); w.title("Comparison Results")
 
-    def compare_by_hash(self):
-        self.update_progress(0, 1, "Listing Src1")
-        f1, tmp1 = list_files(self.src1, tempfile.gettempdir(), lambda i, t: self.update_progress(i, t, "Listing Src1"))
-        self.update_progress(0, 1, "Listing Src2")
-        f2, tmp2 = list_files(self.src2, tempfile.gettempdir(), lambda i, t: self.update_progress(i, t, "Listing Src2"))
-        if tmp1: self.temp_dirs.append(tmp1)
-        if tmp2: self.temp_dirs.append(tmp2)
+        # Show full paths and total files for each source
+        tk.Label(w, text=f"Source 1: {self.src1}", anchor="w", justify="left").grid(row=0,column=0, sticky="w", padx=5)
+        tk.Label(w, text=f"Total files in Src1: {len(f1)}", anchor="w").grid(row=1,column=0, sticky="w", padx=5)
 
-        self.status.config(text="Hashing Source 2...")
-        hashes2 = {}
-        all2 = list(f2.items())
-        for idx, (rel, full) in enumerate(all2, 1):
-            h = compute_hash(full)
-            hashes2[h] = rel
-            self.update_progress(idx, len(all2), "Hashing Src2")
+        tk.Label(w, text=f"Source 2: {self.src2}", anchor="w", justify="left").grid(row=0,column=1, sticky="w", padx=5)
+        tk.Label(w, text=f"Total files in Src2: {len(f2)}", anchor="w").grid(row=1,column=1, sticky="w", padx=5)
 
-        self.status.config(text="Hashing Source 1...")
-        only1 = []
-        only2 = set(hashes2.values())
-        all1 = list(f1.items())
-        for idx, (rel, full) in enumerate(all1, 1):
-            h = compute_hash(full)
-            if h in hashes2:
-                only2.discard(hashes2[h])
-            else:
-                only1.append(rel)
-            self.update_progress(idx, len(all1), "Hashing Src1")
+        # Missing files labels
+        tk.Label(w,text=f"Missing in Src1 ({len(m1)}):").grid(row=2,column=0)
+        tk.Label(w,text=f"Missing in Src2 ({len(m2)}):").grid(row=2,column=1)
 
-        only2 = sorted(only2)
-        self.show_results(only1, only2, f1, f2, "Hash comparison")
+        lb1 = tk.Listbox(w, width=60, height=20)
+        lb2 = tk.Listbox(w, width=60, height=20)
+        lb1.grid(row=3,column=0,padx=5,pady=5)
+        lb2.grid(row=3,column=1,padx=5,pady=5)
 
-    def show_results(self, only1, only2, map1, map2, title):
-        self.root.after(0, lambda: self._show_results(only1, only2, map1, map2, title))
+        for k in m1: lb1.insert("end", k)
+        for k in m2: lb2.insert("end", k)
 
-    def _show_results(self, only1, only2, map1, map2, title):
-        self.progress["value"] = 0
-        self.status.config(text=title + " done.")
-        win = tk.Toplevel(self.root)
-        win.title(f"Results: {title}")
+        def c1(): 
+            for k,fp in m1.items():
+                dst=os.path.join(self.src1,k); os.makedirs(os.path.dirname(dst),exist_ok=True); shutil.copy2(fp,dst)
+            messagebox.showinfo("Copied",f"{len(m1)} files copied to Src1")
+        def c2(): 
+            for k,fp in m2.items():
+                dst=os.path.join(self.src2,k); os.makedirs(os.path.dirname(dst),exist_ok=True); shutil.copy2(fp,dst)
+            messagebox.showinfo("Copied",f"{len(m2)} files copied to Src2")
 
-        frame = tk.Frame(win)
-        frame.pack(padx=10, pady=10)
-
-        tk.Label(frame, text=f"Only in Source 1\n({self.src1})", anchor="center").grid(row=0, column=0)
-        tk.Label(frame, text=f"Only in Source 2\n({self.src2})", anchor="center").grid(row=0, column=1)
-
-        lb1 = tk.Listbox(frame, selectmode=tk.MULTIPLE, width=60, height=20)
-        lb1.grid(row=1, column=0, padx=5)
-        for item in only1:
-            lb1.insert(tk.END, item)
-
-        lb2 = tk.Listbox(frame, selectmode=tk.MULTIPLE, width=60, height=20)
-        lb2.grid(row=1, column=1, padx=5)
-        for item in only2:
-            lb2.insert(tk.END, item)
-
-        def do_copy(lb, src_map, dst):
-            sel = [lb.get(i) for i in lb.curselection()]
-            for rel in sel:
-                srcp = src_map[rel]
-                dstp = os.path.join(dst, rel)
-                os.makedirs(os.path.dirname(dstp), exist_ok=True)
-                shutil.copy2(srcp, dstp)
-            messagebox.showinfo("Copied", f"Copied {len(sel)} files.")
-
-        tk.Button(frame, text="Copy →", command=lambda: do_copy(lb1, map1, self.src2)).grid(row=2, column=0, pady=10)
-        tk.Button(frame, text="← Copy", command=lambda: do_copy(lb2, map2, self.src1)).grid(row=2, column=1, pady=10)
+        tk.Button(w,text="Copy → Src1",command=c1).grid(row=4,column=0,pady=10)
+        tk.Button(w,text="Copy → Src2",command=c2).grid(row=4,column=1,pady=10)
 
     def __del__(self):
-        for d in self.temp_dirs:
-            shutil.rmtree(d, ignore_errors=True)
+        for d in self.temp_dirs: shutil.rmtree(d,ignore_errors=True)
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root=TkinterDnD.Tk()
     CompareApp(root)
     root.mainloop()
