@@ -17,6 +17,7 @@ import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
+from PIL.ExifTags import TAGS
 import sys
 import platform
 import subprocess
