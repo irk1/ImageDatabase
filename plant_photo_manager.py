@@ -68,7 +68,6 @@ os.makedirs(RAW_DIR, exist_ok=True)
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Main photos table
     c.execute('''
         CREATE TABLE IF NOT EXISTS photos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,22 +86,8 @@ def init_db():
             processed_path TEXT,
             raw_attached INTEGER,
             raw_paths TEXT,
-            raw_mode TEXT,
+            raw_mode TEXT,              -- 'copied' or 'referenced'
             created_at TEXT
-        )
-    ''')
-    # Feature mappings
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS feature_mappings (
-            specific_feature TEXT PRIMARY KEY,
-            broad_category TEXT NOT NULL
-        )
-    ''')
-    # Location mappings
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS location_mappings (
-            specific_location TEXT PRIMARY KEY,
-            broad_category TEXT NOT NULL
         )
     ''')
     conn.commit()
@@ -127,18 +112,12 @@ def safe_code(s, length=4):
     combined = consonants + "".join([c for c in s if c in VOWELS])
     return (combined[:length].upper()).ljust(length, "X")
 
-# -------------------------
-# Feature and Location Code Helpers with DB
-# -------------------------
-
-def feature_code(feat, db_conn=None):
-    """Return 3-letter code using broad category mapping from DB or default mapping."""
+def feature_code(feat):
+    """3-letter code for feature, using common mapping or fallback."""
     if not feat:
         return "UNK"
     m = feat.strip().lower()
-
-    # Default broad categories
-    default_mapping = {
+    mapping = {
         "flower": "FLW",
         "leaf": "LEF",
         "root": "ROT",
@@ -153,41 +132,18 @@ def feature_code(feat, db_conn=None):
         "stem": "STM",
         "petiole": "PTL"
     }
-
-    # Try default mapping first
-    for k, v in default_mapping.items():
+    for k, v in mapping.items():
         if k in m:
-            broad = k
-            code = v
-            break
-    else:
-        broad = None
-        code = None
+            return v
+    s = re.sub(r'[^A-Za-z]', '', m)
+    return (s[:3].upper() if s else "UNK")
 
-    # Use DB mapping if available
-    if db_conn:
-        cur = db_conn.cursor()
-        cur.execute("SELECT broad_category FROM feature_mappings WHERE specific_feature=?", (m,))
-        row = cur.fetchone()
-        if row:
-            broad = row[0]
-            code = default_mapping.get(broad, "UNK")
-
-    # If no mapping found, fallback
-    if not code:
-        code = "UNK"
-
-    return code
-
-
-def loc_code(loc, db_conn=None):
-    """Return 2-3 letter code using broad category mapping from DB or default mapping."""
+def loc_code(loc):
+    """2-3 letter location code, mapping with fallbacks."""
     if not loc:
         return "XX"
     m = loc.strip().lower()
-
-    # Default mappings
-    default_mapping = {
+    mapping = {
         "greenhouse": "GH",
         "lab": "LB",
         "garden": "GD",
@@ -198,46 +154,37 @@ def loc_code(loc, db_conn=None):
         "nursery": "NY",
         "field": "FD"
     }
-
-    code = None
-    for k, v in default_mapping.items():
+    for k, v in mapping.items():
         if k in m:
-            code = v
-            break
-
-    # Check DB mappings
-    if db_conn:
-        cur = db_conn.cursor()
-        cur.execute("SELECT broad_category FROM location_mappings WHERE specific_location=?", (m,))
-        row = cur.fetchone()
-        if row:
-            broad = row[0]
-            code = default_mapping.get(broad, safe_code(loc, 3))
-
-    # Fallback
-    if not code:
-        code = safe_code(loc, 3)
-
-    return code.upper()
+            return v
+    sc = safe_code(loc, length=3)
+    return sc[:3]
 
 def short_hash(seed: str, chars=4):
     """Return a short hex from sha1 for collision-resistance."""
     h = hashlib.sha1(seed.encode("utf-8")).hexdigest()
     return h[:chars].upper()
 
-def gen_compact_filename(species, date_taken, main_feature, location, used_topaz, original_name, db_conn=None):
+def gen_compact_filename(species, date_taken, main_feature, location, used_topaz, original_name):
+    """
+    Format:
+    SPEC-DDMMYY-FEA-LOC-AI-HASH.jpg
+    Example: BVAG-241025-FLW-GH-T-A1B2.jpg
+    Returns: (filename, spec_code, feat_code, loc_code)
+    """
     spec_code = safe_code(species, 4)
+    # Normalize date: accept YYYY-MM-DD; fallback to today
     try:
         dt = datetime.datetime.strptime(date_taken, "%Y-%m-%d")
         date_str = dt.strftime("%d%m%y")
     except Exception:
         try:
+            # allow ddmmyy input
             date_str = datetime.datetime.strptime(date_taken, "%d%m%y").strftime("%d%m%y")
         except Exception:
             date_str = datetime.date.today().strftime("%d%m%y")
-
-    feat = feature_code(main_feature, db_conn=db_conn)
-    loc = loc_code(location, db_conn=db_conn)
+    feat = feature_code(main_feature)
+    loc = loc_code(location)
     ai_flag = "T" if used_topaz else "F"
     seed = f"{species}|{date_taken}|{main_feature}|{location}|{original_name}"
     hx = short_hash(seed, chars=4)
@@ -266,129 +213,14 @@ def open_path(path):
 # GUI Application
 # -------------------------
 class PlantPhotoManager(tk.Tk):
-    def bulk_add_raw_selection(self):
-        """
-        Import multiple raw images selected by the user.
-        Auto-fill most info from EXIF. Only prompt for location and subject.
-        """
-        # Let user select multiple files
-        files = filedialog.askopenfilenames(
-            title="Select Raw Images",
-            filetypes=[("Image files", "*.jpg *.jpeg *.png *.tif *.tiff *.CR2 *.NEF *.ARW *.RAF *.RW2 *.DNG")]
-        )
-        if not files:
-            return
-
-        # Prompt user for location and subject (applies to all selected files)
-        def ask_user_inputs():
-            dlg = tk.Toplevel(self)
-            dlg.title("Bulk Raw Import Info")
-            dlg.geometry("400x150")
-            tk.Label(dlg, text="Location (greenhouse, wild, etc.)").pack(pady=5)
-            loc_var = tk.StringVar()
-            tk.Entry(dlg, textvariable=loc_var).pack(pady=5)
-            tk.Label(dlg, text="Subject (flower, stamen, leaf, etc.)").pack(pady=5)
-            subj_var = tk.StringVar()
-            tk.Entry(dlg, textvariable=subj_var).pack(pady=5)
-
-            submitted = tk.BooleanVar(value=False)
-            def submit():
-                if loc_var.get().strip() and subj_var.get().strip():
-                    submitted.set(True)
-                    dlg.destroy()
-                else:
-                    messagebox.showwarning("Missing info", "Please fill both fields.")
-
-            tk.Button(dlg, text="Submit", command=submit).pack(pady=10)
-            self.wait_window(dlg)
-            if submitted.get():
-                return loc_var.get().strip(), subj_var.get().strip()
-            return None, None
-
-        location, subject = ask_user_inputs()
-        if not location or not subject:
-            return
-
-        # Process each selected file
-        for f in files:
-            # Extract date from EXIF if available
-            date_taken = None
-            try:
-                img = Image.open(f)
-                info = img._getexif() or {}
-                for tag, value in info.items():
-                    decoded = TAGS.get(tag, tag)
-                    if decoded == "DateTimeOriginal":
-                        date_taken = datetime.datetime.strptime(value, "%Y:%m:%d %H:%M:%S").date().isoformat()
-                        break
-            except Exception:
-                pass
-            if not date_taken:
-                date_taken = datetime.date.today().isoformat()
-
-            # Pre-fill standard values for raw-only import
-            species = "UNKNOWN"
-            main_feat = "RAW"
-            used_topaz = 0
-
-            # Copy raw into managed RAW_DIR
-            try:
-                bn = os.path.basename(f)
-                dest_name = f"{safe_filename_prefix(species)}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{bn}"
-                dest_path = os.path.join(RAW_DIR, dest_name)
-                shutil.copy2(f, dest_path)
-                raw_attached = 1
-                raw_mode = "copied"
-            except Exception as e:
-                messagebox.showwarning("Copy failed", f"Failed to copy {f}:\n{e}")
-                continue
-
-            # Insert into database
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute('''
-                INSERT INTO photos (
-                    species, species_code, gfib_link, main_feature, feature_code, date_taken,
-                    used_topaz, subject_size, other_features, location, location_code,
-                    processed_filename, processed_path, raw_attached, raw_paths, raw_mode, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                species,
-                safe_code(species, 4),
-                "",
-                main_feat,
-                feature_code(main_feat),
-                date_taken,
-                used_topaz,
-                subject,
-                "",
-                location,
-                loc_code(location),
-                "",
-                "",  # no processed file
-                raw_attached,
-                dest_path,
-                raw_mode,
-                datetime.datetime.now().isoformat()
-            ))
-            conn.commit()
-            conn.close()
-
-        messagebox.showinfo("Bulk Import Done", f"Added {len(files)} raw images with auto-filled metadata.")
-   
         # -------------------------
     # Fetch previous values for autocomplete
     # -------------------------
-    
-        # -------------------------
-    # Fetch previous values / autocomplete
-    # -------------------------
     def get_previous_values(self, field):
-        """Return a sorted list of distinct previous entries for a given metadata field,
-        including specifics from the mapping tables if they exist."""
+        """Return a list of distinct previous entries for a given metadata field."""
         if field not in ("species_var", "feature_var", "size_var", "other_var", "loc_var"):
             return []
-
+        # Map Tk variable names to DB columns
         field_map = {
             "species_var": "species",
             "feature_var": "main_feature",
@@ -397,49 +229,18 @@ class PlantPhotoManager(tk.Tk):
             "loc_var": "location"
         }
         col = field_map.get(field)
-        values = set()
+        if not col:
+            return []
 
         try:
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
-
-            # Add values from photos table
-            if col:
-                c.execute(f"SELECT DISTINCT {col} FROM photos WHERE {col} IS NOT NULL AND {col} != ''")
-                values.update(r[0] for r in c.fetchall() if r[0])
-
-            # Add specifics from mappings tables
-            if field == "feature_var":
-                c.execute("SELECT specific_feature FROM feature_mappings")
-                values.update(r[0] for r in c.fetchall() if r[0])
-            elif field == "loc_var":
-                c.execute("SELECT specific_location FROM location_mappings")
-                values.update(r[0] for r in c.fetchall() if r[0])
-
+            c.execute(f"SELECT DISTINCT {col} FROM photos WHERE {col} IS NOT NULL AND {col} != ''")
+            rows = c.fetchall()
             conn.close()
+            return [r[0] for r in rows if r[0]]
         except Exception:
-            pass
-
-        return sorted(values)
-
-
-    # -------------------------
-    # Autocomplete Entry Setup
-    # -------------------------
-    def setup_autocomplete(self, entry_widget, field_name):
-        """Attach a basic autocomplete to a Tk Entry widget based on previous values."""
-        values = self.get_previous_values(field_name)
-        if not values:
-            return
-
-        def on_key_release(event):
-            typed = entry_widget.get()
-            entry_widget.tk.call("autocomplete::complete", entry_widget._w, typed)
-
-        # create a Tcl autocomplete for simplicity
-        self.tk.call("package", "require", "autocomplete")
-        entry_widget.bind("<KeyRelease>", on_key_release)
-        entry_widget.tk.call("autocomplete::setList", entry_widget._w, " ".join(values))
+            return []
 
     def __init__(self):
         super().__init__()
@@ -474,86 +275,106 @@ class PlantPhotoManager(tk.Tk):
     # ---------------------
     def build_add_tab(self):
         frm = self.add_frame
-        topfrm = ttk.Frame(frm, padding=8)
-        midfrm = ttk.Frame(frm, padding=8)
-        bottomfrm = ttk.Frame(frm, padding=8)
-        topfrm.pack(fill="x")
-        midfrm.pack(fill="both", expand=True)
-        bottomfrm.pack(fill="x")
 
-        # Variables
+        # Scrollable canvas/frame to contain everything
+        canvas = tk.Canvas(frm)
+        vscroll = ttk.Scrollbar(frm, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+
+        left = ttk.Frame(scrollable_frame, padding=10)
+        right = ttk.Frame(scrollable_frame, padding=10)
+        left.pack(side="left", fill="y", padx=(8,4))
+        right.pack(side="left", fill="both", expand=True, padx=(4,8))
+
+        # Processed image selector
+        ttk.Label(left, text="Processed image (required)").grid(row=0, column=0, sticky="w")
         self.proc_path_var = tk.StringVar()
-        self.species_var = tk.StringVar()
-        self.gfib_var = tk.StringVar()
-        self.feature_var = tk.StringVar()
-        self.date_var = tk.StringVar()
-        self.size_var = tk.StringVar()
-        self.other_var = tk.StringVar()
-        self.loc_var = tk.StringVar()
-        self.topaz_var = tk.IntVar(value=0)
+        ttk.Entry(left, textvariable=self.proc_path_var, width=46).grid(row=1, column=0, sticky="w")
+        ttk.Button(left, text="Browse...", command=self.browse_processed).grid(row=1, column=1, padx=6)
+
+        # Raw file attach
+        ttk.Label(left, text="Attach raw file(s) (optional)").grid(row=2, column=0, sticky="w", pady=(10,0))
+        self.raw_listbox = tk.Listbox(left, height=5, width=60)
+        self.raw_listbox.grid(row=3, column=0, columnspan=2, sticky="w")
+        ttk.Button(left, text="Add Raw Files...", command=self.browse_raw).grid(row=4, column=0, pady=6, sticky="w")
+        ttk.Button(left, text="Remove Selected Raw", command=self.remove_selected_raw).grid(row=4, column=1, pady=6, sticky="w")
+
+        # Option: copy raw or reference
         self.copy_raw_var = tk.IntVar(value=1)
+        chk = tk.Checkbutton(
+            left,
+            text="Copy raw files into managed raw/ folder\n(uncheck to only reference original paths)",
+            variable=self.copy_raw_var,
+            wraplength=320,
+            justify="left",
+            anchor="w",
+            padx=4
+        )
+        chk.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        # Metadata fields with autocomplete
+        row = 6
+        def mk_entry(label_text, varname, autocomplete=True):
+            nonlocal row
+            setattr(self, varname, tk.StringVar())
+            ttk.Label(left, text=label_text).grid(row=row, column=0, sticky="w", pady=(6,0))
+            if autocomplete:
+                cb = ttk.Combobox(
+                    left,
+                    textvariable=getattr(self, varname),
+                    width=46,
+                    values=self.get_previous_values(varname)
+                )
+                cb.grid(row=row+1, column=0, columnspan=2, sticky="w")
+            else:
+                ttk.Entry(left, textvariable=getattr(self, varname), width=46).grid(row=row+1, column=0, columnspan=2, sticky="w")
+            row += 2
+
+        mk_entry("Species (Genus species)", "species_var")
+        mk_entry("Link to GFIB (optional)", "gfib_var", autocomplete=False)
+        mk_entry("Main feature (flower, leaf...)", "feature_var")
+        mk_entry("Date taken (YYYY-MM-DD)", "date_var", autocomplete=False)
+        mk_entry("Subject size (macro/small/med/large)", "size_var")
+        mk_entry("Other visible features (comma sep)", "other_var")
+        mk_entry("Location (greenhouse, wild...)", "loc_var")
+
+        self.topaz_var = tk.IntVar(value=0)
+        ttk.Checkbutton(left, text="Processed with Topaz AI", variable=self.topaz_var).grid(row=row, column=0, sticky="w", pady=8)
+        row += 1
+
+        # Filename preview + actions
+        ttk.Label(left, text="Generated filename preview").grid(row=row, column=0, sticky="w")
         self.preview_var = tk.StringVar()
+        ttk.Entry(left, textvariable=self.preview_var, width=46, state="readonly").grid(row=row+1, column=0, columnspan=2, sticky="w")
+        ttk.Button(left, text="Generate Preview", command=self.update_preview).grid(row=row+1, column=1, padx=6)
+        row += 2
 
-        # Top frame: main metadata
-        ttk.Label(topfrm, text="Processed Image:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(topfrm, textvariable=self.proc_path_var, width=40).grid(row=0, column=1, sticky="w")
-        ttk.Button(topfrm, text="Browse", command=self.browse_processed).grid(row=0, column=2, padx=4)
+        ttk.Button(left, text="Save Entry (Copy files & write DB)", command=self.save_entry).grid(row=row, column=0, pady=12, sticky="w")
+        ttk.Button(left, text="Clear", command=self.clear_add_form).grid(row=row, column=1, pady=12, sticky="e")
 
-        ttk.Label(topfrm, text="Species:").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(topfrm, textvariable=self.species_var, width=20).grid(row=1, column=1, sticky="w", pady=4)
+        # Right: thumbnail, attached raw list, and notes
+        ttk.Label(right, text="Processed Image Preview").pack(anchor="w")
+        self.thumb_label = ttk.Label(right)
+        self.thumb_label.pack(pady=6)
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(right, text="Attached raw files").pack(anchor="w")
+        self.raw_files_text = tk.Text(right, height=8, wrap="word")
+        self.raw_files_text.pack(fill="both", expand=False)
 
-        ttk.Label(topfrm, text="GFIB link:").grid(row=1, column=2, sticky="w", pady=4)
-        ttk.Entry(topfrm, textvariable=self.gfib_var, width=25).grid(row=1, column=3, sticky="w", pady=4)
-
-        ttk.Label(topfrm, text="Feature:").grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Entry(topfrm, textvariable=self.feature_var, width=20).grid(row=2, column=1, sticky="w", pady=4)
-
-        ttk.Label(topfrm, text="Date taken (YYYY-MM-DD):").grid(row=2, column=2, sticky="w", pady=4)
-        ttk.Entry(topfrm, textvariable=self.date_var, width=15).grid(row=2, column=3, sticky="w", pady=4)
-
-        ttk.Label(topfrm, text="Subject size:").grid(row=3, column=0, sticky="w", pady=4)
-        ttk.Entry(topfrm, textvariable=self.size_var, width=20).grid(row=3, column=1, sticky="w", pady=4)
-
-        ttk.Label(topfrm, text="Other features:").grid(row=3, column=2, sticky="w", pady=4)
-        ttk.Entry(topfrm, textvariable=self.other_var, width=25).grid(row=3, column=3, sticky="w", pady=4)
-
-        ttk.Label(topfrm, text="Location:").grid(row=4, column=0, sticky="w", pady=4)
-        ttk.Entry(topfrm, textvariable=self.loc_var, width=20).grid(row=4, column=1, sticky="w", pady=4)
-
-        ttk.Checkbutton(topfrm, text="Topaz used", variable=self.topaz_var).grid(row=4, column=2, sticky="w", padx=4)
-        ttk.Checkbutton(topfrm, text="Copy raw files", variable=self.copy_raw_var).grid(row=4, column=3, sticky="w", padx=4)
-
-        # Mid frame: raw file selection
-        raw_frame = ttk.LabelFrame(midfrm, text="Raw files")
-        raw_frame.pack(fill="both", expand=True, padx=4, pady=4)
-
-        self.raw_listbox = tk.Listbox(raw_frame, height=6)
-        self.raw_listbox.pack(side="left", fill="both", expand=True, padx=2, pady=2)
-        self.raw_files_text = tk.Text(raw_frame, height=6, width=50)
-        self.raw_files_text.pack(side="left", fill="both", expand=True, padx=2, pady=2)
-
-        btn_frame = ttk.Frame(raw_frame)
-        btn_frame.pack(side="left", fill="y", padx=2)
-        ttk.Button(btn_frame, text="Add raw...", command=self.browse_raw).pack(pady=2)
-        ttk.Button(btn_frame, text="Remove selected", command=self.remove_selected_raw).pack(pady=2)
-        ttk.Button(btn_frame, text="Bulk import raw...", command=self.bulk_add_raw_selection).pack(pady=2)
-
-        # Bottom frame: thumbnail, preview, save
-        thumb_frame = ttk.LabelFrame(bottomfrm, text="Processed image preview")
-        thumb_frame.pack(side="left", fill="both", expand=True, padx=4, pady=4)
-        self.thumb_label = ttk.Label(thumb_frame, text="No image selected")
-        self.thumb_label.pack(fill="both", expand=True, padx=4, pady=4)
-
-        preview_frame = ttk.Frame(bottomfrm)
-        preview_frame.pack(side="left", fill="both", expand=True, padx=4, pady=4)
-        ttk.Label(preview_frame, text="Filename preview:").pack(anchor="w")
-        ttk.Entry(preview_frame, textvariable=self.preview_var, width=40, state="readonly").pack(anchor="w", pady=2)
-        ttk.Label(preview_frame, text="Notes preview:").pack(anchor="w", pady=(8,0))
-        self.note_preview = tk.Text(preview_frame, height=5, width=50)
-        self.note_preview.pack(fill="both", expand=True, pady=2)
-
-        ttk.Button(bottomfrm, text="Save Entry", command=self.save_entry).pack(side="right", padx=4, pady=4)
-
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(right, text="Notes / Quick view").pack(anchor="w")
+        self.note_preview = tk.Text(right, height=8, wrap="word")
+        self.note_preview.pack(fill="both", expand=True)
     
     def browse_processed(self):
         p = filedialog.askopenfilename(title="Select processed image",
