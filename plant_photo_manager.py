@@ -21,7 +21,7 @@ from PIL.ExifTags import TAGS
 import sys
 import platform
 import subprocess
-
+from tkinterdnd2 import DND_FILES, TkinterDnD
 # -------------------------
 # Configuration / Folders
 # -------------------------
@@ -266,19 +266,88 @@ def open_path(path):
 # -------------------------
 # GUI Application
 # -------------------------
-class PlantPhotoManager(tk.Tk):
-    def bulk_add_raw_selection(self):
+class PlantPhotoManager(TkinterDnD.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Plant Photo Manager")
+        self.geometry("900x600")
+
+        # --- Initialize notebook ---
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        # --- Create tabs ---
+        self.create_main_tab()   # Your main tab function
+        self.create_raw_tab()    # The raw files tab with drag-and-drop
+
+        # --- Initialize other components ---
+        self.setup_database()    # Example: database setup
+        self.load_initial_data() # Example: load initial data if needed
+
+        # --- Any other initialization ---
+        # self.some_other_setup()
+
+    def create_raw_tab(self):
         """
-        Import multiple raw images selected by the user.
-        Auto-fill most info from EXIF. Only prompt for location and subject.
+        Create the Raw Files tab in the notebook and prepare it for drag-and-drop.
         """
-        # Let user select multiple files
-        files = filedialog.askopenfilenames(
-            title="Select Raw Images",
-            filetypes=[("Image files", "*.jpg *.jpeg *.png *.tif *.tiff *.CR2 *.NEF *.ARW *.RAF *.RW2 *.DNG")]
-        )
+        if not hasattr(self, 'notebook'):
+            print("Error: Notebook widget does not exist.")
+            return
+
+        # Create the tab frame
+        self.raw_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.raw_tab, text="Raw Files")
+
+        # Example content: listbox to show dropped files
+        self.raw_listbox = tk.Listbox(self.raw_tab, width=80, height=20)
+        self.raw_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Enable drag-and-drop now that the tab exists
+        self.enable_drag_and_drop()
+
+    def enable_drag_and_drop(self):
+        """
+        Enable drag-and-drop support for the raw_tab to accept files.
+        Requires the tkinterdnd2 module.
+        """
+        try:
+            from tkinterdnd2 import DND_FILES
+        except ImportError:
+            print("tkinterdnd2 module not installed; drag-and-drop disabled.")
+            return
+
+        if hasattr(self, 'raw_tab') and self.raw_tab is not None:
+            self.raw_tab.drop_target_register(DND_FILES)
+            self.raw_tab.dnd_bind('<<Drop>>', self.handle_drop)
+        else:
+            print("Warning: raw_tab does not exist. Drag-and-drop not enabled.")
+
+    def bulk_add_raw_selection(self, filepaths=None):
+        """Add multiple raw files either via filedialog or drag-and-drop."""
+        if filepaths is None:
+            files = filedialog.askopenfilenames(
+                title="Select raw image files",
+                filetypes=[("Raw Images", "*.CR2 *.NEF *.ARW *.DNG"), ("All Files", "*.*")]
+            )
+        else:
+            files = filepaths
+
         if not files:
             return
+
+        for filepath in files:
+            try:
+                filename = os.path.basename(filepath)
+                species = self.get_species_from_filename(filename)
+                prefix = safe_filename_prefix(species)
+                timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                new_filename = f"{prefix}_{timestamp}_{filename}"
+                dest_path = os.path.join(self.raw_dir, new_filename)
+                shutil.copy2(filepath, dest_path)
+                self.db_insert_raw_file(species, new_filename)
+            except Exception as e:
+                print(f"Error adding file {filepath}: {e}")
 
         # Prompt user for location and subject (applies to all selected files)
         def ask_user_inputs():
@@ -442,14 +511,8 @@ class PlantPhotoManager(tk.Tk):
         entry_widget.bind("<KeyRelease>", on_key_release)
         entry_widget.tk.call("autocomplete::setList", entry_widget._w, " ".join(values))
 
-    def __init__(self):
-        super().__init__()
-        self.title("Plant Photo Manager")
-        self.geometry("1050x700")
-        self.minsize(950, 620)
-        init_db()
-        self.setup_widgets()
-        self.populate_db_view()
+    
+        
 
     def setup_widgets(self):
         notebook = ttk.Notebook(self)
