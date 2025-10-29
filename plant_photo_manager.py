@@ -20,6 +20,7 @@ from PIL import Image, ImageTk
 import sys
 import platform
 import subprocess
+import threading
 
 # -------------------------
 # Configuration / Folders
@@ -29,44 +30,143 @@ PROCESSED_DIR = os.path.join(APP_DIR, "processed")
 RAW_DIR = os.path.join(APP_DIR, "raw")
 THUMB_SIZE = (320, 240)
 
+
 # -------------------------
-# Database file selection
+# Utility functions
 # -------------------------
+
+def gen_compact_filename(species, date_taken, feat=None, loc=None, used_topaz=False, original_name=None):
+    """
+    Generate a compact filename for a plant image.
+    
+    Args:
+        species (str): Species name.
+        date_taken (str or datetime.date): Date the photo was taken.
+        feat (str, optional): Feature code.
+        loc (str, optional): Location code.
+        used_topaz (bool, optional): Flag if Topaz enhancement was used.
+        original_name (str, optional): Original filename.
+    
+    Returns:
+        tuple: (fname, spec_code, feat_code, locc)
+    """
+
+    # Example logic to generate codes
+    spec_code = species[:3].upper() if species else "UNK"
+    feat_code = feat[:2].upper() if feat else "XX"
+    locc = loc[:2].upper() if loc else "YY"
+
+    # Construct filename
+    date_str = date_taken.strftime("%Y%m%d") if hasattr(date_taken, "strftime") else str(date_taken)
+    topaz_tag = "_T" if used_topaz else ""
+    orig_tag = f"_{original_name}" if original_name else ""
+    
+    fname = f"{spec_code}{feat_code}{locc}_{date_str}{topaz_tag}{orig_tag}.jpg"
+
+    return fname, spec_code, feat_code, locc
+
+
+def open_path(path):
+    """
+    Open a file or folder using the OS default method.
+    """
+    if not os.path.exists(path):
+        messagebox.showwarning("Missing", f"Path does not exist:\n{path}")
+        return
+
+    try:
+        if platform.system() == "Windows":
+            os.startfile(path)
+        elif platform.system() == "Darwin":  # macOS
+            subprocess.run(["open", path])
+        else:  # Linux and others
+            subprocess.run(["xdg-open", path])
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not open path:\n{e}")
+
+
+# -------------------------
+# Database file selection and initialization
+# -------------------------
+
+import threading
+
 DEFAULT_DB_FILE = os.path.join(APP_DIR, "plant_photos.db")
 
-def select_db_file():
-    """
-    Prompt user to select a database file on startup.
-    Falls back to DEFAULT_DB_FILE if canceled.
-    """
-    try:
-        from tkinter import filedialog, Tk
-        # hide root window
-        root = Tk()
-        root.withdraw()
-        path = filedialog.askopenfilename(
-            title="Select Plant Photo Database",
-            filetypes=[("SQLite Database", "*.db"), ("All files", "*.*")]
+def select_or_create_db():
+    """Prompt once for a database file, or create default if none chosen."""
+    from tkinter import Tk, filedialog
+    root = Tk()
+    root.withdraw()
+    path = filedialog.askopenfilename(
+        title="Select Plant Photo Database",
+        filetypes=[("SQLite Database", "*.db"), ("All files", "*.*")]
+    )
+    root.destroy()
+
+    if not path:
+        path = DEFAULT_DB_FILE
+        print(f"No file selected — using default: {path}")
+
+    if not os.path.exists(path):
+        print(f"Creating new database at: {path}")
+        init_db_at(path)
+    return path
+
+
+def init_db_at(db_path):
+    """Initialize all required database tables."""
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+
+    # Photos table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            species TEXT,
+            species_code TEXT,
+            gfib_link TEXT,
+            main_feature TEXT,
+            feature_code TEXT,
+            date_taken TEXT,
+            used_topaz INTEGER,
+            subject_size TEXT,
+            other_features TEXT,
+            location TEXT,
+            location_code TEXT,
+            processed_filename TEXT,
+            processed_path TEXT,
+            raw_attached INTEGER,
+            raw_paths TEXT,
+            raw_mode TEXT,
+            created_at TEXT
         )
-        root.destroy()
-        if path:
-            return path
-    except Exception:
-        pass
-    return DEFAULT_DB_FILE
+    ''')
 
-DB_FILE = select_db_file()
-
-# Ensure processed/raw directories exist
-os.makedirs(PROCESSED_DIR, exist_ok=True)
-os.makedirs(RAW_DIR, exist_ok=True)
+    # Mapping tables
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS feature_mappings (
+            specific TEXT PRIMARY KEY,
+            general TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS location_mappings (
+            specific TEXT PRIMARY KEY,
+            general TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
 
 # -------------------------
-# Database
+# Database initialization and mapping
 # -------------------------
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
+
+def init_db_if_missing(db_path):
+    """Ensure the database and its tables exist."""
+    conn = sqlite3.connect(db_path)
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS photos (
@@ -86,134 +186,114 @@ def init_db():
             processed_path TEXT,
             raw_attached INTEGER,
             raw_paths TEXT,
-            raw_mode TEXT,              -- 'copied' or 'referenced'
+            raw_mode TEXT,
             created_at TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS feature_mappings (
+            specific TEXT PRIMARY KEY,
+            general TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS location_mappings (
+            specific TEXT PRIMARY KEY,
+            general TEXT
         )
     ''')
     conn.commit()
     conn.close()
 
-# -------------------------
-# Compact Code Generators
-# -------------------------
-VOWELS = set("AEIOUaeiou")
 
-def safe_code(s, length=4):
-    """Make a short code from a species or location string."""
-    if not s:
-        return ("X" * length)[:length]
-    s = re.sub(r'[^A-Za-z]', '', s)
-    if not s:
-        return ("X" * length)[:length]
-    # Prefer consonants first
-    consonants = "".join([c for c in s if c not in VOWELS])
-    if len(consonants) >= length:
-        return consonants[:length].upper()
-    combined = consonants + "".join([c for c in s if c in VOWELS])
-    return (combined[:length].upper()).ljust(length, "X")
+def select_or_create_db():
+    """Prompt user to select an existing DB or create a new one."""
+    from tkinter import Tk, filedialog
+    root = Tk()
+    root.withdraw()
 
-def feature_code(feat):
-    """3-letter code for feature, using common mapping or fallback."""
-    if not feat:
-        return "UNK"
-    m = feat.strip().lower()
-    mapping = {
-        "flower": "FLW",
-        "leaf": "LEF",
-        "root": "ROT",
-        "inflorescence": "INF",
-        "habit": "HBT",
-        "fruit": "FRT",
-        "seed": "SED",
-        "spike": "SPK",
-        "bulb": "BLB",
-        "pseudobulb": "PSB",
-        "rhizome": "RHZ",
-        "stem": "STM",
-        "petiole": "PTL"
-    }
-    for k, v in mapping.items():
-        if k in m:
-            return v
-    s = re.sub(r'[^A-Za-z]', '', m)
-    return (s[:3].upper() if s else "UNK")
+    path = filedialog.askopenfilename(
+        title="Select Existing Plant Photo Database",
+        filetypes=[("SQLite Database", "*.db"), ("All files", "*.*")]
+    )
 
-def loc_code(loc):
-    """2-3 letter location code, mapping with fallbacks."""
-    if not loc:
-        return "XX"
-    m = loc.strip().lower()
-    mapping = {
-        "greenhouse": "GH",
-        "lab": "LB",
-        "garden": "GD",
-        "wild": "WL",
-        "mountain": "MT",
-        "forest": "FR",
-        "indoor": "IN",
-        "nursery": "NY",
-        "field": "FD"
-    }
-    for k, v in mapping.items():
-        if k in m:
-            return v
-    sc = safe_code(loc, length=3)
-    return sc[:3]
+    if not path:
+        path = filedialog.asksaveasfilename(
+            title="Create New Plant Photo Database",
+            defaultextension=".db",
+            filetypes=[("SQLite Database", "*.db"), ("All files", "*.*")]
+        )
 
-def short_hash(seed: str, chars=4):
-    """Return a short hex from sha1 for collision-resistance."""
-    h = hashlib.sha1(seed.encode("utf-8")).hexdigest()
-    return h[:chars].upper()
+    root.destroy()
+    return path or os.path.join(APP_DIR, "plant_photos.db")
 
-def gen_compact_filename(species, date_taken, main_feature, location, used_topaz, original_name):
-    """
-    Format:
-    SPEC-DDMMYY-FEA-LOC-AI-HASH.jpg
-    Example: BVAG-241025-FLW-GH-T-A1B2.jpg
-    Returns: (filename, spec_code, feat_code, loc_code)
-    """
-    spec_code = safe_code(species, 4)
-    # Normalize date: accept YYYY-MM-DD; fallback to today
+
+def load_specific_mappings(db_path):
+    """Load feature and location mappings safely."""
+    feature_map, location_map = {}, {}
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
     try:
-        dt = datetime.datetime.strptime(date_taken, "%Y-%m-%d")
-        date_str = dt.strftime("%d%m%y")
-    except Exception:
-        try:
-            # allow ddmmyy input
-            date_str = datetime.datetime.strptime(date_taken, "%d%m%y").strftime("%d%m%y")
-        except Exception:
-            date_str = datetime.date.today().strftime("%d%m%y")
-    feat = feature_code(main_feature)
-    loc = loc_code(location)
-    ai_flag = "T" if used_topaz else "F"
-    seed = f"{species}|{date_taken}|{main_feature}|{location}|{original_name}"
-    hx = short_hash(seed, chars=4)
-    fname = f"{spec_code}-{date_str}-{feat}-{loc}-{ai_flag}-{hx}.jpg"
-    fname = re.sub(r'[^A-Za-z0-9._-]', '', fname)
-    return fname, spec_code, feat, loc
+        for row in c.execute("SELECT specific, general FROM feature_mappings"):
+            feature_map[row[0]] = row[1]
+    except sqlite3.OperationalError:
+        print("Warning: feature_mappings table not found, skipping...")
 
-# -------------------------
-# Utils: open file in OS
-# -------------------------
-def open_path(path):
-    if not path or not os.path.exists(path):
-        messagebox.showerror("File not found", f"Path does not exist:\n{path}")
-        return
     try:
-        if platform.system() == "Windows":
-            os.startfile(path)
-        elif platform.system() == "Darwin":
-            subprocess.call(["open", path])
-        else:
-            subprocess.call(["xdg-open", path])
-    except Exception as e:
-        messagebox.showerror("Open failed", str(e))
+        for row in c.execute("SELECT specific, general FROM location_mappings"):
+            location_map[row[0]] = row[1]
+    except sqlite3.OperationalError:
+        print("Warning: location_mappings table not found, skipping...")
+
+    conn.close()
+    return feature_map, location_map
+
+
+# --- One-time setup before GUI ---
+DB_FILE = select_or_create_db()
+
+# Ensure database exists and has proper schema
+init_db_if_missing(DB_FILE)
+
+# Make sure working folders exist
+os.makedirs(PROCESSED_DIR, exist_ok=True)
+os.makedirs(RAW_DIR, exist_ok=True)
+
+# Prepare empty mappings (will load in GUI)
+FEATURE_MAP, LOCATION_MAP = {}, {}
+
+
 
 # -------------------------
 # GUI Application
 # -------------------------
 class PlantPhotoManager(tk.Tk):
-        # -------------------------
+    def __init__(self):
+        print("[DEBUG] Initializing PlantPhotoManager...")
+        super().__init__()
+        print("[DEBUG] Tk root created.")
+        self.title("Plant Photo Manager")
+        self.geometry("1050x700")
+        self.minsize(950, 620)
+
+        # Setup empty maps; will load in background
+        global FEATURE_MAP, LOCATION_MAP
+        FEATURE_MAP = {}
+        LOCATION_MAP = {}
+
+        print("[DEBUG] Loading mappings into memory...")
+        try:
+            FEATURE_MAP, LOCATION_MAP = load_specific_mappings(DB_FILE)
+            print(f"[DEBUG] Feature mappings loaded: {len(FEATURE_MAP)}")
+            print(f"[DEBUG] Location mappings loaded: {len(LOCATION_MAP)}")
+        except Exception as e:
+            print("[DEBUG] Mapping load error:", e)
+
+        print("[DEBUG] Starting GUI widget setup...")
+        self.setup_widgets()
+        print("[DEBUG] Finished setup_widgets()")
+
+    # -------------------------
     # Fetch previous values for autocomplete
     # -------------------------
     def get_previous_values(self, field):
@@ -242,14 +322,23 @@ class PlantPhotoManager(tk.Tk):
         except Exception:
             return []
 
-    def __init__(self):
-        super().__init__()
-        self.title("Plant Photo Manager")
-        self.geometry("1050x700")
-        self.minsize(950, 620)
-        init_db()
-        self.setup_widgets()
-        self.populate_db_view()
+    
+    def load_mappings_async(self):
+        import threading
+        def loader():
+            global FEATURE_MAP, LOCATION_MAP
+            load_specific_mappings(DB_FILE)
+            print("Feature/Location mappings loaded successfully.")
+            # Refresh autocomplete entries after loading
+            self.after(0, self.refresh_autocomplete)
+        threading.Thread(target=loader, daemon=True).start()
+
+    def refresh_autocomplete(self):
+        """Refresh all autocomplete comboboxes in Add tab after mappings are loaded."""
+        for varname in ("species_var", "feature_var", "size_var", "other_var", "loc_var"):
+            cb = getattr(self, varname + "_combobox", None)
+            if cb:
+                cb['values'] = self.get_previous_values(varname)
 
     def setup_widgets(self):
         notebook = ttk.Notebook(self)
@@ -293,8 +382,8 @@ class PlantPhotoManager(tk.Tk):
 
         left = ttk.Frame(scrollable_frame, padding=10)
         right = ttk.Frame(scrollable_frame, padding=10)
-        left.pack(side="left", fill="y", padx=(8,4))
-        right.pack(side="left", fill="both", expand=True, padx=(4,8))
+        left.pack(side="left", fill="y", padx=(8, 4))
+        right.pack(side="left", fill="both", expand=True, padx=(4, 8))
 
         # Processed image selector
         ttk.Label(left, text="Processed image (required)").grid(row=0, column=0, sticky="w")
@@ -303,15 +392,15 @@ class PlantPhotoManager(tk.Tk):
         ttk.Button(left, text="Browse...", command=self.browse_processed).grid(row=1, column=1, padx=6)
 
         # Raw file attach
-        ttk.Label(left, text="Attach raw file(s) (optional)").grid(row=2, column=0, sticky="w", pady=(10,0))
+        ttk.Label(left, text="Attach raw file(s) (optional)").grid(row=2, column=0, sticky="w", pady=(10, 0))
         self.raw_listbox = tk.Listbox(left, height=5, width=60)
         self.raw_listbox.grid(row=3, column=0, columnspan=2, sticky="w")
         ttk.Button(left, text="Add Raw Files...", command=self.browse_raw).grid(row=4, column=0, pady=6, sticky="w")
         ttk.Button(left, text="Remove Selected Raw", command=self.remove_selected_raw).grid(row=4, column=1, pady=6, sticky="w")
 
-        # Option: copy raw or reference
+        # Option: copy raw or reference (tk.Checkbutton supports wraplength)
         self.copy_raw_var = tk.IntVar(value=1)
-        chk = tk.Checkbutton(
+        tk.Checkbutton(
             left,
             text="Copy raw files into managed raw/ folder\n(uncheck to only reference original paths)",
             variable=self.copy_raw_var,
@@ -319,15 +408,14 @@ class PlantPhotoManager(tk.Tk):
             justify="left",
             anchor="w",
             padx=4
-        )
-        chk.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         # Metadata fields with autocomplete
         row = 6
         def mk_entry(label_text, varname, autocomplete=True):
             nonlocal row
             setattr(self, varname, tk.StringVar())
-            ttk.Label(left, text=label_text).grid(row=row, column=0, sticky="w", pady=(6,0))
+            ttk.Label(left, text=label_text).grid(row=row, column=0, sticky="w", pady=(6, 0))
             if autocomplete:
                 cb = ttk.Combobox(
                     left,
@@ -375,7 +463,7 @@ class PlantPhotoManager(tk.Tk):
         ttk.Label(right, text="Notes / Quick view").pack(anchor="w")
         self.note_preview = tk.Text(right, height=8, wrap="word")
         self.note_preview.pack(fill="both", expand=True)
-    
+
     def browse_processed(self):
         p = filedialog.askopenfilename(title="Select processed image",
                                        filetypes=[("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"), ("All files", "*.*")])
@@ -393,7 +481,7 @@ class PlantPhotoManager(tk.Tk):
 
     def browse_raw(self):
         ps = filedialog.askopenfilenames(title="Select raw files (can choose multiple)",
-                                         filetypes=[("Raw/Images", "*.CR2 *.NEF *.ARW *.dng *.raf *.rw2 *.tif *.tiff *.jpg *.jpeg *.png"), ("All files", "*.*")])
+                                         filetypes=[("Raw/Images", "*.CR2 *.NEF *.ARW *.dng *.raf *.rw2 *.tif *.tiff *.DNG *.ORF"), ("All files", "*.*")])
         for p in ps:
             if p not in self.raw_listbox.get(0, 'end'):
                 self.raw_listbox.insert("end", p)
@@ -825,8 +913,26 @@ def safe_filename_prefix(s):
 # Run
 # -------------------------
 def main():
-    init_db()
+    if not DB_FILE:
+        print("No database selected or created. Exiting.")
+        sys.exit(0)
+
     app = PlantPhotoManager()
+    print("[DEBUG] Tk root created.")
+
+    # Load mappings in a background thread
+    def load_mappings_bg():
+        global FEATURE_MAP, LOCATION_MAP
+        print("[DEBUG] Loading mappings into memory...")
+        FEATURE_MAP, LOCATION_MAP = load_specific_mappings(DB_FILE)
+        print(f"[DEBUG] Feature mappings loaded: {len(FEATURE_MAP)}")
+        print(f"[DEBUG] Location mappings loaded: {len(LOCATION_MAP)}")
+        # If GUI needs updates, schedule safely:
+        app.after(0, lambda: print("[DEBUG] Mappings loaded callback executed"))
+
+    import threading
+    threading.Thread(target=load_mappings_bg, daemon=True).start()
+
     app.mainloop()
 
 if __name__ == "__main__":
