@@ -228,30 +228,96 @@ def select_or_create_db():
     return path or os.path.join(APP_DIR, "plant_photos.db")
 
 
-def load_specific_mappings(db_path):
-    """Load feature and location mappings safely."""
-    feature_map, location_map = {}, {}
-    conn = sqlite3.connect(db_path)
+def load_specific_mappings(db_file):
+    """
+    Safely loads feature and location mappings from the database.
+    Returns: (FEATURE_MAP, LOCATION_MAP)
+    """
+    FEATURE_MAP = {}
+    LOCATION_MAP = {}
+    try:
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+
+        # Ensure tables exist
+        c.execute("""CREATE TABLE IF NOT EXISTS feature_mappings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT,
+                        parent_id INTEGER,
+                        general TEXT
+                     )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS location_mappings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT,
+                        parent_id INTEGER,
+                        general TEXT
+                     )""")
+        conn.commit()
+
+        # Load feature mappings
+        c.execute("SELECT specific, general FROM feature_mappings")
+        for name, general in c.fetchall():
+            FEATURE_MAP[name] = general
+
+        # Load location mappings
+        c.execute("SELECT specific, general FROM location_mappings")
+        for name, general in c.fetchall():
+            LOCATION_MAP[name] = general
+
+    except Exception as e:
+        messagebox.showerror("Database Error", f"Error loading mappings:\n{e}")
+    finally:
+        conn.close()
+
+    return FEATURE_MAP, LOCATION_MAP
+
+
+def ensure_db():
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    try:
-        for row in c.execute("SELECT specific, general FROM feature_mappings"):
-            feature_map[row[0]] = row[1]
-    except sqlite3.OperationalError:
-        print("Warning: feature_mappings table not found, skipping...")
-
-    try:
-        for row in c.execute("SELECT specific, general FROM location_mappings"):
-            location_map[row[0]] = row[1]
-    except sqlite3.OperationalError:
-        print("Warning: location_mappings table not found, skipping...")
-
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS photos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        species TEXT,
+        species_code TEXT,
+        gfib_link TEXT,
+        main_feature TEXT,
+        feature_code TEXT,
+        date_taken TEXT,
+        used_topaz INTEGER,
+        subject_size TEXT,
+        other_features TEXT,
+        location TEXT,
+        location_code TEXT,
+        processed_filename TEXT,
+        processed_path TEXT,
+        raw_attached INTEGER,
+        raw_paths TEXT,
+        raw_mode TEXT,
+        created_at TEXT
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS feature_mappings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        parent_id INTEGER,
+        general TEXT
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS location_mappings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        parent_id INTEGER,
+        general TEXT
+    )""")
+    conn.commit()
     conn.close()
-    return feature_map, location_map
 
 
 # --- One-time setup before GUI ---
 DB_FILE = select_or_create_db()
-
+ensure_db()
+db_file = DB_FILE
 # Ensure database exists and has proper schema
 init_db_if_missing(DB_FILE)
 
@@ -268,31 +334,34 @@ FEATURE_MAP, LOCATION_MAP = {}, {}
 # GUI Application
 # -------------------------
 class PlantPhotoManager(tk.Tk):
-    def __init__(self):
+    def __init__(self, db_file):
         print("[DEBUG] Initializing PlantPhotoManager...")
         super().__init__()
-        print("[DEBUG] Tk root created.")
+
+        # Assign database file
+        self.db_file = db_file
+
+        # Set up main window
         self.title("Plant Photo Manager")
         self.geometry("1050x700")
         self.minsize(950, 620)
 
-        # Setup empty maps; will load in background
+        # Setup empty maps; will load immediately
         global FEATURE_MAP, LOCATION_MAP
         FEATURE_MAP = {}
         LOCATION_MAP = {}
 
         print("[DEBUG] Loading mappings into memory...")
         try:
-            FEATURE_MAP, LOCATION_MAP = load_specific_mappings(DB_FILE)
+            FEATURE_MAP, LOCATION_MAP = load_specific_mappings(self.db_file)
             print(f"[DEBUG] Feature mappings loaded: {len(FEATURE_MAP)}")
             print(f"[DEBUG] Location mappings loaded: {len(LOCATION_MAP)}")
         except Exception as e:
             print("[DEBUG] Mapping load error:", e)
 
         print("[DEBUG] Starting GUI widget setup...")
-        self.setup_widgets()
+        self.setup_widgets()  # Only call once
         print("[DEBUG] Finished setup_widgets()")
-
     # -------------------------
     # Fetch previous values for autocomplete
     # -------------------------
@@ -324,13 +393,17 @@ class PlantPhotoManager(tk.Tk):
 
     
     def load_mappings_async(self):
+        """
+        Loads FEATURE_MAP and LOCATION_MAP in a background thread safely.
+        Updates GUI via self.after().
+        """
         import threading
+
         def loader():
             global FEATURE_MAP, LOCATION_MAP
-            load_specific_mappings(DB_FILE)
-            print("Feature/Location mappings loaded successfully.")
-            # Refresh autocomplete entries after loading
+            FEATURE_MAP, LOCATION_MAP = load_specific_mappings(DB_FILE)
             self.after(0, self.refresh_autocomplete)
+
         threading.Thread(target=loader, daemon=True).start()
 
     def refresh_autocomplete(self):
@@ -341,25 +414,32 @@ class PlantPhotoManager(tk.Tk):
                 cb['values'] = self.get_previous_values(varname)
 
     def setup_widgets(self):
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill="both", expand=True)
+        # Use self.notebook instead of a local variable
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
 
-        self.add_frame = ttk.Frame(notebook)
-        self.search_frame = ttk.Frame(notebook)
-        self.db_frame = ttk.Frame(notebook)
+        self.add_frame = ttk.Frame(self.notebook)
+        self.search_frame = ttk.Frame(self.notebook)
+        self.db_frame = ttk.Frame(self.notebook)
 
-        notebook.add(self.add_frame, text="Add New Entry")
-        notebook.add(self.search_frame, text="Search / Filter")
-        notebook.add(self.db_frame, text="Database View / Export")
+        self.notebook.add(self.add_frame, text="Add New Entry")
+        self.notebook.add(self.search_frame, text="Search / Filter")
+        self.notebook.add(self.db_frame, text="Database View / Export")
 
         self.build_add_tab()
         self.build_search_tab()
         self.build_db_tab()
 
+        # --- Add Edit Entries Tab ---
+        self.edit_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.edit_tab, text="Edit Entries")
+        self.build_edit_tab()
+
+            
+        # --- Mappings tab ---
+        self.build_mappings_tab()
+
     # ---------------------
-    # Add Tab
-    # ---------------------
-        # ---------------------
     # Add Tab
     # ---------------------
     def build_add_tab(self):
@@ -464,9 +544,505 @@ class PlantPhotoManager(tk.Tk):
         self.note_preview = tk.Text(right, height=8, wrap="word")
         self.note_preview.pack(fill="both", expand=True)
 
+    def build_edit_tab(self):
+        """Build the Edit Entries tab with search, editable fields, and image management."""
+
+        # --- Search Section ---
+        search_frame = ttk.LabelFrame(self.edit_tab, text="Search / Select Entry")
+        search_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(search_frame, text="Species:").grid(row=0, column=0, sticky="w")
+        self.edit_species_var = tk.StringVar()
+        ttk.Entry(search_frame, textvariable=self.edit_species_var).grid(row=0, column=1, padx=5, sticky="ew")
+
+        ttk.Label(search_frame, text="Date Taken:").grid(row=0, column=2, sticky="w")
+        self.edit_date_var = tk.StringVar()
+        ttk.Entry(search_frame, textvariable=self.edit_date_var).grid(row=0, column=3, padx=5, sticky="ew")
+
+        ttk.Button(search_frame, text="Search", command=self.search_entries).grid(row=0, column=4, padx=5)
+
+        search_frame.columnconfigure(1, weight=1)
+        search_frame.columnconfigure(3, weight=1)
+
+        # --- Results List ---
+        results_frame = ttk.LabelFrame(self.edit_tab, text="Matching Entries")
+        results_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.edit_results_list = tk.Listbox(results_frame, height=8)
+        self.edit_results_list.pack(side="left", fill="both", expand=True)
+        self.edit_results_list.bind("<<ListboxSelect>>", self.load_selected_entry)
+
+        scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=self.edit_results_list.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.edit_results_list.config(yscrollcommand=scrollbar.set)
+
+        # --- Editable Fields Section ---
+        fields_frame = ttk.LabelFrame(self.edit_tab, text="Edit Metadata / Associated Images")
+        fields_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Species
+        ttk.Label(fields_frame, text="Species:").grid(row=0, column=0, sticky="w")
+        self.edit_species_entry = ttk.Entry(fields_frame)
+        self.edit_species_entry.grid(row=0, column=1, sticky="ew", padx=5)
+
+        # Main Feature
+        ttk.Label(fields_frame, text="Main Feature:").grid(row=1, column=0, sticky="w")
+        self.edit_feature_entry = ttk.Entry(fields_frame)
+        self.edit_feature_entry.grid(row=1, column=1, sticky="ew", padx=5)
+
+        # Location
+        ttk.Label(fields_frame, text="Location:").grid(row=2, column=0, sticky="w")
+        self.edit_location_entry = ttk.Entry(fields_frame)
+        self.edit_location_entry.grid(row=2, column=1, sticky="ew", padx=5)
+
+        # Date Taken
+        ttk.Label(fields_frame, text="Date Taken:").grid(row=3, column=0, sticky="w")
+        self.edit_date_entry = ttk.Entry(fields_frame)
+        self.edit_date_entry.grid(row=3, column=1, sticky="ew", padx=5)
+
+        # Used Topaz
+        ttk.Label(fields_frame, text="Used Topaz:").grid(row=4, column=0, sticky="w")
+        self.edit_topaz_var = tk.BooleanVar()
+        ttk.Checkbutton(fields_frame, variable=self.edit_topaz_var).grid(row=4, column=1, sticky="w", padx=5)
+
+        # Raw Files
+        ttk.Label(fields_frame, text="Raw Files:").grid(row=5, column=0, sticky="w")
+        self.edit_raw_var = tk.StringVar()
+        ttk.Entry(fields_frame, textvariable=self.edit_raw_var, state="readonly").grid(row=5, column=1, sticky="ew", padx=5)
+        ttk.Button(fields_frame, text="Add/Change Raw Files", command=self.browse_edit_raw).grid(row=5, column=2, padx=5)
+
+        # Processed File
+        ttk.Label(fields_frame, text="Processed File:").grid(row=6, column=0, sticky="w")
+        self.edit_processed_var = tk.StringVar()
+        ttk.Entry(fields_frame, textvariable=self.edit_processed_var, state="readonly").grid(row=6, column=1, sticky="ew", padx=5)
+        ttk.Button(fields_frame, text="Select Processed File", command=self.browse_edit_processed).grid(row=6, column=2, padx=5)
+
+        # Save Changes Button
+        ttk.Button(fields_frame, text="Save Changes", command=self.save_edited_entry).grid(row=7, column=0, columnspan=3, pady=10)
+
+        # Make the fields expand nicely
+        fields_frame.columnconfigure(1, weight=1)
+
+    # --- Major Mappings Tab ---
+    def build_mappings_tab(self):
+        # Clear previous tab if needed
+        if hasattr(self, 'mappings_tab'):
+            self.mappings_tab.destroy()
+
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.mappings_tab = ttk.Notebook(self)
+        self.mappings_tab.pack(fill="both", expand=True)
+
+        # Build features and locations tabs
+        self.build_feature_tab()
+        self.build_location_tab()
+
+
+    # --- Feature Mappings Sub-tab ---
+    def build_feature_tab(self):
+        import tkinter as tk
+        from tkinter import ttk
+
+        if hasattr(self, 'feature_frame'):
+            self.feature_frame.destroy()
+
+        self.feature_frame = ttk.Frame(self.mappings_tab)
+        self.feature_frame.pack(fill="both", expand=True)
+
+        feature_tree = self.load_feature_tree()
+
+        self.feature_treeview = ttk.Treeview(self.feature_frame)
+        self.feature_treeview.pack(fill="both", expand=True)
+
+        for general, specifics in feature_tree.items():
+            general_id = self.feature_treeview.insert("", "end", text=general)
+            for specific in specifics:
+                self.feature_treeview.insert(general_id, "end", text=specific)
+
+
+    def load_feature_tree(self):
+        """
+        Load the feature hierarchy from the database.
+        Returns a dict: {general_category: [specific_features]}
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+
+        c.execute("SELECT specific, general FROM feature_mappings")
+        rows = c.fetchall()
+        conn.close()
+
+        feature_tree = {}
+        for specific, general in rows:
+            if general not in feature_tree:
+                feature_tree[general] = []
+            feature_tree[general].append(specific)
+
+        return feature_tree
+
+
+    def add_feature(self):
+        """Add a new feature under a selected parent."""
+        selection = self.feature_tree.selection()
+        parent_id = int(selection[0]) if selection else None
+
+        def save_new():
+            name = name_var.get().strip()
+            general = general_var.get().strip() or name
+            if not name:
+                messagebox.showwarning("Invalid", "Feature name cannot be empty.")
+                return
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("INSERT INTO feature_mappings (name, parent_id, general) VALUES (?, ?, ?)",
+                    (name, parent_id, general))
+            conn.commit()
+            conn.close()
+            self.load_feature_tree()
+            add_win.destroy()
+
+        add_win = tk.Toplevel(self)
+        add_win.title("Add Feature")
+        ttk.Label(add_win, text="Feature Name:").grid(row=0, column=0, padx=5, pady=5)
+        name_var = tk.StringVar()
+        ttk.Entry(add_win, textvariable=name_var).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(add_win, text="Top-Level Category (optional):").grid(row=1, column=0, padx=5, pady=5)
+        general_var = tk.StringVar()
+        ttk.Entry(add_win, textvariable=general_var).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(add_win, text="Save", command=save_new).grid(row=2, column=0, columnspan=2, pady=10)
+
+
+    def edit_feature(self):
+        """Edit the selected feature."""
+        selection = self.feature_tree.selection()
+        if not selection:
+            messagebox.showwarning("Select Feature", "Please select a feature to edit.")
+            return
+        feature_id = int(selection[0])
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT name, general FROM feature_mappings WHERE id=?", (feature_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return
+
+        def save_edit():
+            new_name = name_var.get().strip()
+            new_general = general_var.get().strip() or new_name
+            if not new_name:
+                messagebox.showwarning("Invalid", "Feature name cannot be empty.")
+                return
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("UPDATE feature_mappings SET name=?, general=? WHERE id=?", (new_name, new_general, feature_id))
+            conn.commit()
+            conn.close()
+            self.load_feature_tree()
+            edit_win.destroy()
+
+        edit_win = tk.Toplevel(self)
+        edit_win.title("Edit Feature")
+        ttk.Label(edit_win, text="Feature Name:").grid(row=0, column=0, padx=5, pady=5)
+        name_var = tk.StringVar(value=row[0])
+        ttk.Entry(edit_win, textvariable=name_var).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(edit_win, text="Top-Level Category (optional):").grid(row=1, column=0, padx=5, pady=5)
+        general_var = tk.StringVar(value=row[1])
+        ttk.Entry(edit_win, textvariable=general_var).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(edit_win, text="Save", command=save_edit).grid(row=2, column=0, columnspan=2, pady=10)
+
+
+    def remove_feature(self):
+        """Remove a feature and all its children recursively."""
+        selection = self.feature_tree.selection()
+        if not selection:
+            messagebox.showwarning("Select Feature", "Please select a feature to remove.")
+            return
+        feature_id = int(selection[0])
+        if not messagebox.askyesno("Confirm Delete", "Delete this feature and all sub-features?"):
+            return
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+
+        def delete_recursive(fid):
+            c.execute("SELECT id FROM feature_mappings WHERE parent_id=?", (fid,))
+            for (child_id,) in c.fetchall():
+                delete_recursive(child_id)
+            c.execute("DELETE FROM feature_mappings WHERE id=?", (fid,))
+
+        delete_recursive(feature_id)
+        conn.commit()
+        conn.close()
+        self.load_feature_tree()
+
+
+    # --- Location Mappings Sub-tab ---
+    def build_location_tab(self):
+        import tkinter as tk
+        from tkinter import ttk
+
+        if hasattr(self, 'location_frame'):
+            self.location_frame.destroy()
+
+        self.location_frame = ttk.Frame(self.mappings_tab)
+        self.location_frame.pack(fill="both", expand=True)
+
+        location_tree = self.load_location_tree()
+
+        self.location_treeview = ttk.Treeview(self.location_frame)
+        self.location_treeview.pack(fill="both", expand=True)
+
+        for general, specifics in location_tree.items():
+            general_id = self.location_treeview.insert("", "end", text=general)
+            for specific in specifics:
+                self.location_treeview.insert(general_id, "end", text=specific)
+
+
+    def load_location_tree(self):
+        """
+        Load the location hierarchy from the database.
+        Returns a dict: {general_location: [specific_locations]}
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+
+        c.execute("SELECT specific, general FROM location_mappings")
+        rows = c.fetchall()
+        conn.close()
+
+        location_tree = {}
+        for specific, general in rows:
+            if general not in location_tree:
+                location_tree[general] = []
+            location_tree[general].append(specific)
+
+        return location_tree
+
+
+    def add_location(self):
+        """Add a new location under a selected parent."""
+        selection = self.location_tree.selection()
+        parent_id = int(selection[0]) if selection else None
+
+        def save_new():
+            name = name_var.get().strip()
+            general = general_var.get().strip() or name
+            if not name:
+                messagebox.showwarning("Invalid", "Location name cannot be empty.")
+                return
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("INSERT INTO location_mappings (name, parent_id, general) VALUES (?, ?, ?)",
+                    (name, parent_id, general))
+            conn.commit()
+            conn.close()
+            self.load_location_tree()
+            add_win.destroy()
+
+        add_win = tk.Toplevel(self)
+        add_win.title("Add Location")
+        ttk.Label(add_win, text="Location Name:").grid(row=0, column=0, padx=5, pady=5)
+        name_var = tk.StringVar()
+        ttk.Entry(add_win, textvariable=name_var).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(add_win, text="Top-Level Category (optional):").grid(row=1, column=0, padx=5, pady=5)
+        general_var = tk.StringVar()
+        ttk.Entry(add_win, textvariable=general_var).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(add_win, text="Save", command=save_new).grid(row=2, column=0, columnspan=2, pady=10)
+
+
+    def edit_location(self):
+        """Edit the selected location."""
+        selection = self.location_tree.selection()
+        if not selection:
+            messagebox.showwarning("Select Location", "Please select a location to edit.")
+            return
+        loc_id = int(selection[0])
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT name, general FROM location_mappings WHERE id=?", (loc_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return
+
+        def save_edit():
+            new_name = name_var.get().strip()
+            new_general = general_var.get().strip() or new_name
+            if not new_name:
+                messagebox.showwarning("Invalid", "Location name cannot be empty.")
+                return
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("UPDATE location_mappings SET name=?, general=? WHERE id=?", (new_name, new_general, loc_id))
+            conn.commit()
+            conn.close()
+            self.load_location_tree()
+            edit_win.destroy()
+
+        edit_win = tk.Toplevel(self)
+        edit_win.title("Edit Location")
+        ttk.Label(edit_win, text="Location Name:").grid(row=0, column=0, padx=5, pady=5)
+        name_var = tk.StringVar(value=row[0])
+        ttk.Entry(edit_win, textvariable=name_var).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(edit_win, text="Top-Level Category (optional):").grid(row=1, column=0, padx=5, pady=5)
+        general_var = tk.StringVar(value=row[1])
+        ttk.Entry(edit_win, textvariable=general_var).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(edit_win, text="Save", command=save_edit).grid(row=2, column=0, columnspan=2, pady=10)
+
+
+    def remove_location(self):
+        """Remove a location and all its children recursively."""
+        selection = self.location_tree.selection()
+        if not selection:
+            messagebox.showwarning("Select Location", "Please select a location to remove.")
+            return
+        loc_id = int(selection[0])
+        if not messagebox.askyesno("Confirm Delete", "Delete this location and all sub-locations?"):
+            return
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+
+        def delete_recursive(lid):
+            c.execute("SELECT id FROM location_mappings WHERE parent_id=?", (lid,))
+            for (child_id,) in c.fetchall():
+                delete_recursive(child_id)
+            c.execute("DELETE FROM location_mappings WHERE id=?", (lid,))
+
+        delete_recursive(loc_id)
+        conn.commit()
+        conn.close()
+        self.load_location_tree()
+
+    def search_entries(self):
+        """Search the database for matching entries based on the search fields."""
+        # Clear previous results
+        self.edit_results_list.delete(0, tk.END)
+
+        species = self.edit_species_var.get().strip()
+        date_taken = self.edit_date_var.get().strip()
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+
+        query = "SELECT id, species, date_taken FROM photos WHERE 1=1"
+        params = []
+
+        if species:
+            query += " AND species LIKE ?"
+            params.append(f"%{species}%")
+        if date_taken:
+            query += " AND date_taken LIKE ?"
+            params.append(f"%{date_taken}%")
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        conn.close()
+
+        for row in rows:
+            self.edit_results_list.insert(tk.END, f"{row[0]} | {row[1]} | {row[2]}")
+
+    def load_selected_entry(self, event):
+        """Load the selected entry's metadata into the editable fields."""
+        selection = self.edit_results_list.curselection()
+        if not selection:
+            return
+
+        entry_text = self.edit_results_list.get(selection[0])
+        entry_id = int(entry_text.split("|")[0].strip())
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT * FROM photos WHERE id=?", (entry_id,))
+        row = c.fetchone()
+        conn.close()
+
+        if row:
+            # Map columns to fields
+            self.edit_species_entry.delete(0, tk.END)
+            self.edit_species_entry.insert(0, row[1])
+            self.edit_feature_entry.delete(0, tk.END)
+            self.edit_feature_entry.insert(0, row[4])
+            self.edit_location_entry.delete(0, tk.END)
+            self.edit_location_entry.insert(0, row[10])
+            self.edit_date_entry.delete(0, tk.END)
+            self.edit_date_entry.insert(0, row[6])
+            self.edit_topaz_var.set(bool(row[7]))
+            self.edit_raw_var.set(row[15] or "")
+            self.edit_processed_var.set(row[12] or "")
+
+            self.current_edit_id = entry_id  # store which entry we are editing
+
+    def browse_edit_raw(self):
+        """Select new raw files for the entry."""
+        files = filedialog.askopenfilenames(title="Select Raw Files", filetypes=[("Camera RAW", "*.CR2 *.NEF *.ARW *.DNG *.RAF")])
+        if files:
+            self.edit_raw_var.set(";".join(files))
+
+    def browse_edit_processed(self):
+        """Select a processed file for the entry."""
+        file = filedialog.askopenfilename(title="Select Processed File", filetypes=[("Images", "*.jpg *.png *.jpeg *.tiff *.tif")])
+        if file:
+            self.edit_processed_var.set(file)
+
+    def save_edited_entry(self):
+        """Save the edited metadata and file paths back to the database."""
+        if not hasattr(self, "current_edit_id"):
+            messagebox.showwarning("No Selection", "Please select an entry to edit.")
+            return
+
+        species = self.edit_species_entry.get().strip()
+        feature = self.edit_feature_entry.get().strip()
+        location = self.edit_location_entry.get().strip()
+        date_taken = self.edit_date_entry.get().strip()
+        used_topaz = int(self.edit_topaz_var.get())
+        raw_paths = self.edit_raw_var.get()
+        processed_file = self.edit_processed_var.get()
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            UPDATE photos
+            SET species=?, main_feature=?, location=?, date_taken=?, used_topaz=?, raw_paths=?, processed_filename=?
+            WHERE id=?
+        """, (species, feature, location, date_taken, used_topaz, raw_paths, processed_file, self.current_edit_id))
+        conn.commit()
+        conn.close()
+
+        messagebox.showinfo("Saved", "Entry updated successfully.")
+        self.search_entries()  # refresh list after update
+
+
+    def browse_file(self):
+        """Open a file dialog to select an image, update the entry and preview."""
+        file_path = filedialog.askopenfilename(
+            title="Select an image",
+            filetypes=[("Image Files", "*.png *.jpg *.jpeg *.gif *.bmp")]
+        )
+        if file_path:
+            self.proc_path_var.set(file_path)  # Update the entry field
+            # Update the preview image
+            try:
+                img = Image.open(file_path)
+                img.thumbnail((200, 200))
+                self.preview_image = ImageTk.PhotoImage(img)
+                self.preview_label.config(image=self.preview_image)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open image:\n{e}")
+
+
     def browse_processed(self):
         p = filedialog.askopenfilename(title="Select processed image",
-                                       filetypes=[("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"), ("All files", "*.*")])
+                                    filetypes=[("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"), ("All files", "*.*")])
         if p:
             self.proc_path_var.set(p)
             self.show_thumbnail(p)
@@ -481,7 +1057,7 @@ class PlantPhotoManager(tk.Tk):
 
     def browse_raw(self):
         ps = filedialog.askopenfilenames(title="Select raw files (can choose multiple)",
-                                         filetypes=[("Raw/Images", "*.CR2 *.NEF *.ARW *.dng *.raf *.rw2 *.tif *.tiff *.DNG *.ORF"), ("All files", "*.*")])
+                                        filetypes=[("Raw/Images", "*.CR2 *.NEF *.ARW *.dng *.raf *.rw2 *.tif *.tiff *.DNG *.ORF"), ("All files", "*.*")])
         for p in ps:
             if p not in self.raw_listbox.get(0, 'end'):
                 self.raw_listbox.insert("end", p)
@@ -507,123 +1083,66 @@ class PlantPhotoManager(tk.Tk):
             self.thumb_label.configure(image="", text=f"Preview not available\n{e}")
 
     def update_preview(self):
-        species = self.species_var.get()
-        date_taken = self.date_var.get() or datetime.date.today().isoformat()
-        feat = self.feature_var.get()
-        loc = self.loc_var.get()
-        used_topaz = bool(self.topaz_var.get())
-        original_name = os.path.basename(self.proc_path_var.get()) or "UNDEF"
-        fname, spec_code, feat_code, locc = gen_compact_filename(species, date_taken, feat, loc, used_topaz, original_name)
-        self.preview_var.set(fname)
-        # simple quick note preview
-        note_lines = [
-            f"Species code: {spec_code}",
-            f"Feature code: {feat_code}",
-            f"Location code: {locc}",
-            f"Topaz: {'Yes' if used_topaz else 'No'}",
-        ]
-        self.note_preview.delete("1.0", "end")
-        self.note_preview.insert("end", "\n".join(note_lines))
+        """
+        Updates the image preview safely.
+        """
+        path = self.proc_path_var.get()
+        if not path or not os.path.exists(path):
+            # Clear the preview if file missing
+            self.preview_label.config(image='')
+            return
+
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(path)
+            img.thumbnail((250, 250))
+            self.preview_img = ImageTk.PhotoImage(img)
+            self.preview_label.config(image=self.preview_img)
+        except Exception as e:
+            messagebox.showerror("Preview Error", f"Could not load image:\n{e}")
 
     def save_entry(self):
-        proc = self.proc_path_var.get()
-        if not proc or not os.path.exists(proc):
-            messagebox.showerror("Missing processed image", "Please select a processed image to save.")
+        """
+        Safely saves the current entry to the database.
+        """
+        proc_path = self.proc_path_var.get()
+        if not proc_path or not os.path.exists(proc_path):
+            messagebox.showerror("Error", "Processed image path is invalid or missing.")
             return
 
-        species = self.species_var.get().strip()
-        gfib = self.gfib_var.get().strip()
-        main_feat = self.feature_var.get().strip()
-        date_taken = self.date_var.get().strip() or datetime.date.today().isoformat()
-        used_topaz = int(self.topaz_var.get())
-        subject_size = self.size_var.get().strip()
-        other = self.other_var.get().strip()
-        location = self.loc_var.get().strip()
-        raw_paths = [self.raw_listbox.get(i) for i in range(self.raw_listbox.size())]
-        raw_attached = 1 if raw_paths else 0
-        raw_mode = "copied" if self.copy_raw_var.get() else "referenced"
-
-        fname, spec_code, feat_code, locc = gen_compact_filename(species, date_taken, main_feat, location, bool(used_topaz), os.path.basename(proc))
-
-        # copy processed file to PROCESSED_DIR with fname (avoid overwriting)
-        dest_proc = os.path.join(PROCESSED_DIR, fname)
-        if os.path.exists(dest_proc):
-            base, ext = os.path.splitext(fname)
-            suffix = 1
-            while os.path.exists(os.path.join(PROCESSED_DIR, f"{base}-{suffix}{ext}")):
-                suffix += 1
-            fname = f"{base}-{suffix}{ext}"
-            dest_proc = os.path.join(PROCESSED_DIR, fname)
-        try:
-            shutil.copy2(proc, dest_proc)
-        except Exception as e:
-            messagebox.showerror("Copy failed", f"Failed to copy processed image:\n{e}")
-            return
-
-        # handle raw files: either copy into RAW_DIR or keep references
-        handled_raw_paths = []
-        for rp in raw_paths:
-            if not os.path.exists(rp):
-                # skip missing but alert
-                messagebox.showwarning("Raw missing", f"Raw file not found, skipping:\n{rp}")
-                continue
-            if raw_mode == "copied":
-                try:
-                    bn = os.path.basename(rp)
-                    prefix = safe_filename_prefix(species)
-                    dest_name = f"{prefix}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{bn}"
-                    dest = os.path.join(RAW_DIR, dest_name)
-                    # ensure uniqueness
-                    if os.path.exists(dest):
-                        base, ext = os.path.splitext(dest)
-                        c = 1
-                        while os.path.exists(f"{base}_{c}{ext}"):
-                            c += 1
-                        dest = f"{base}_{c}{ext}"
-                    shutil.copy2(rp, dest)
-                    handled_raw_paths.append(dest)
-                except Exception as e:
-                    messagebox.showwarning("Raw copy warning", f"Failed to copy raw file {rp}:\n{e}")
-                    # fallback to storing reference
-                    handled_raw_paths.append(rp)
-            else:
-                handled_raw_paths.append(rp)
-
-        # write to DB
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute('''
-            INSERT INTO photos (
-                species, species_code, gfib_link, main_feature, feature_code, date_taken,
-                used_topaz, subject_size, other_features, location, location_code,
-                processed_filename, processed_path, raw_attached, raw_paths, raw_mode, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            species,
-            spec_code,
-            gfib,
-            main_feat,
-            feat_code,
-            date_taken,
-            used_topaz,
-            subject_size,
-            other,
-            location,
-            locc,
-            fname,
-            dest_proc,
-            raw_attached,
-            "|".join(handled_raw_paths),
-            raw_mode,
-            datetime.datetime.now().isoformat()
-        ))
-        conn.commit()
-        conn.close()
-
-        messagebox.showinfo("Saved", f"Entry saved.\nProcessed file: {dest_proc}\nRaw files attached: {len(handled_raw_paths)} (mode: {raw_mode})")
-        self.clear_add_form()
-        self.populate_db_view()
-        self.populate_search_results()
+        try:
+            c.execute("""INSERT INTO photos
+                        (species, species_code, gfib_link, main_feature, feature_code,
+                        date_taken, used_topaz, subject_size, other_features,
+                        location, location_code, processed_filename, processed_path,
+                        raw_attached, raw_paths, raw_mode, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (self.species_var.get(),
+                    self.species_var.get().upper(),
+                    self.gfib_var.get(),
+                    self.feature_var.get(),
+                    self.feature_var.get().upper(),
+                    self.date_var.get(),
+                    self.topaz_var.get(),
+                    self.size_var.get(),
+                    self.other_var.get(),
+                    self.loc_var.get(),
+                    self.loc_var.get().upper(),
+                    os.path.basename(proc_path),
+                    proc_path,
+                    1 if self.raw_listbox.size() > 0 else 0,
+                    ",".join(self.raw_listbox.get(0, tk.END)),
+                    "copy" if self.copy_raw_var.get() else "link",
+                    datetime.now().isoformat()
+                    ))
+            conn.commit()
+            messagebox.showinfo("Success", "Entry saved successfully!")
+        except Exception as e:
+            messagebox.showerror("Database Error", f"Failed to save entry:\n{e}")
+        finally:
+            conn.close()
 
     def clear_add_form(self):
         self.proc_path_var.set("")
@@ -637,6 +1156,10 @@ class PlantPhotoManager(tk.Tk):
         self.note_preview.delete("1.0", "end")
         self.copy_raw_var.set(1)
 
+
+
+
+    
 # ---------------------
 # Search Tab
 # ---------------------
@@ -792,7 +1315,7 @@ class PlantPhotoManager(tk.Tk):
             messagebox.showinfo("No results", "No results to export.")
             return
         save_path = filedialog.asksaveasfilename(title="Export CSV", defaultextension=".csv",
-                                                 filetypes=[("CSV", "*.csv")])
+                                                filetypes=[("CSV", "*.csv")])
         if not save_path:
             return
         # build export list from the search query constraints
@@ -854,6 +1377,8 @@ class PlantPhotoManager(tk.Tk):
         ttk.Button(top, text="Compact DB (VACUUM)", command=self.vacuum_db).pack(side="left", padx=6)
         ttk.Button(top, text="Open processed folder", command=lambda: open_path(PROCESSED_DIR)).pack(side="left", padx=6)
         ttk.Button(top, text="Open raw folder", command=lambda: open_path(RAW_DIR)).pack(side="left", padx=6)
+
+
 
         cols = ("id", "species", "date_taken", "main_feature", "used_topaz", "processed_filename", "raw_attached", "raw_mode")
         self.db_tree = ttk.Treeview(bottom, columns=cols, show="headings")
@@ -917,7 +1442,8 @@ def main():
         print("No database selected or created. Exiting.")
         sys.exit(0)
 
-    app = PlantPhotoManager()
+    app = PlantPhotoManager(DB_FILE)
+    app.mainloop()
     print("[DEBUG] Tk root created.")
 
     # Load mappings in a background thread
