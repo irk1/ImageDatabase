@@ -15,7 +15,7 @@ import csv
 import datetime
 import re
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, simpledialog, messagebox
 from PIL import Image, ImageTk
 import sys
 import platform
@@ -115,7 +115,7 @@ def select_or_create_db():
 
 
 def init_db_at(db_path):
-    """Initialize all required database tables."""
+    """Initialize all required database tables with correct schema."""
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
 
@@ -143,19 +143,25 @@ def init_db_at(db_path):
         )
     ''')
 
-    # Mapping tables
+    # ✅ Correct Feature Mappings (with feature_name)
     c.execute('''
         CREATE TABLE IF NOT EXISTS feature_mappings (
-            specific TEXT PRIMARY KEY,
-            general TEXT
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feature_name TEXT NOT NULL,
+            parent_id INTEGER,
+            general TEXT,
+            FOREIGN KEY (parent_id) REFERENCES feature_mappings(id)
         )
     ''')
+
+    # Location Mappings table
     c.execute('''
         CREATE TABLE IF NOT EXISTS location_mappings (
-            specific TEXT PRIMARY KEY,
+            location_name TEXT PRIMARY KEY,
             general TEXT
         )
     ''')
+
     conn.commit()
     conn.close()
 
@@ -168,6 +174,8 @@ def init_db_if_missing(db_path):
     """Ensure the database and its tables exist."""
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
+
+    # Photos table (unchanged)
     c.execute('''
         CREATE TABLE IF NOT EXISTS photos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,18 +198,25 @@ def init_db_if_missing(db_path):
             created_at TEXT
         )
     ''')
+
+    # Feature mappings table with hierarchy
     c.execute('''
         CREATE TABLE IF NOT EXISTS feature_mappings (
-            specific TEXT PRIMARY KEY,
-            general TEXT
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feature_name TEXT NOT NULL,
+            parent_id INTEGER,
+            FOREIGN KEY (parent_id) REFERENCES feature_mappings(id)
         )
     ''')
+
+    # Location mappings table (unchanged)
     c.execute('''
         CREATE TABLE IF NOT EXISTS location_mappings (
-            specific TEXT PRIMARY KEY,
+            location_name TEXT PRIMARY KEY,
             general TEXT
         )
     ''')
+
     conn.commit()
     conn.close()
 
@@ -229,45 +244,34 @@ def select_or_create_db():
 
 
 def load_specific_mappings(db_file):
-    """
-    Safely loads feature and location mappings from the database.
-    Returns: (FEATURE_MAP, LOCATION_MAP)
-    """
+    """Load hierarchical feature mappings into dictionaries for use elsewhere."""
+    conn = sqlite3.connect(db_file)
+    c = conn.cursor()
+
+    # Always ensure the table exists before querying
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS feature_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feature_name TEXT NOT NULL,
+            parent_id INTEGER,
+            FOREIGN KEY (parent_id) REFERENCES feature_mappings(id)
+        )
+    """)
+    conn.commit()
+
+    # Now it is safe to query
+    c.execute("SELECT id, feature_name, parent_id FROM feature_mappings")
+    rows = c.fetchall()
+    conn.close()
+
+    # Build in-memory maps
     FEATURE_MAP = {}
     LOCATION_MAP = {}
-    try:
-        conn = sqlite3.connect(db_file)
-        c = conn.cursor()
 
-        # Ensure tables exist
-        c.execute("""CREATE TABLE IF NOT EXISTS feature_mappings (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT,
-                        parent_id INTEGER,
-                        general TEXT
-                     )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS location_mappings (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT,
-                        parent_id INTEGER,
-                        general TEXT
-                     )""")
-        conn.commit()
-
-        # Load feature mappings
-        c.execute("SELECT specific, general FROM feature_mappings")
-        for name, general in c.fetchall():
-            FEATURE_MAP[name] = general
-
-        # Load location mappings
-        c.execute("SELECT specific, general FROM location_mappings")
-        for name, general in c.fetchall():
-            LOCATION_MAP[name] = general
-
-    except Exception as e:
-        messagebox.showerror("Database Error", f"Error loading mappings:\n{e}")
-    finally:
-        conn.close()
+    for row_id, feature_name, parent_id in rows:
+        FEATURE_MAP[row_id] = parent_id
+        if parent_id is not None:
+            LOCATION_MAP.setdefault(parent_id, []).append(row_id)
 
     return FEATURE_MAP, LOCATION_MAP
 
@@ -299,19 +303,20 @@ def ensure_db():
     c.execute("""
     CREATE TABLE IF NOT EXISTS feature_mappings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
+        feature_name TEXT NOT NULL,
         parent_id INTEGER,
         general TEXT
     )""")
     c.execute("""
     CREATE TABLE IF NOT EXISTS location_mappings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
+        location_name TEXT NOT NULL,
         parent_id INTEGER,
         general TEXT
     )""")
     conn.commit()
     conn.close()
+
 
 
 # --- One-time setup before GUI ---
@@ -340,6 +345,10 @@ class PlantPhotoManager(tk.Tk):
 
         # Assign database file
         self.db_file = db_file
+        init_db_if_missing(self.db_file)
+
+        self.conn = sqlite3.connect(self.db_file)
+        self.conn.row_factory = sqlite3.Row  # optional: access rows by column name
 
         # Set up main window
         self.title("Plant Photo Manager")
@@ -625,206 +634,437 @@ class PlantPhotoManager(tk.Tk):
 
     # --- Major Mappings Tab ---
     def build_mappings_tab(self):
-        # Clear previous tab if needed
-        if hasattr(self, 'mappings_tab'):
-            self.mappings_tab.destroy()
+        """Create the main Mappings tab with sub-tabs for Features and Locations."""
+        # Main frame for Mappings
+        mappings_frame = ttk.Frame(self.notebook)
+        self.notebook.add(mappings_frame, text="Mappings")
 
-        import tkinter as tk
-        from tkinter import ttk
+        # Sub-notebook for Features and Locations
+        self.mappings_sub_notebook = ttk.Notebook(mappings_frame)
+        self.mappings_sub_notebook.pack(fill="both", expand=True)
 
-        self.mappings_tab = ttk.Notebook(self)
-        self.mappings_tab.pack(fill="both", expand=True)
-
-        # Build features and locations tabs
+        # Build feature and location sub-tabs
         self.build_feature_tab()
         self.build_location_tab()
 
-
-    # --- Feature Mappings Sub-tab ---
     def build_feature_tab(self):
-        import tkinter as tk
-        from tkinter import ttk
+        self.ensure_feature_table()
+        """Create the hierarchical feature tree tab with unrestricted depth."""
+        feature_frame = ttk.Frame(self.mappings_sub_notebook)
+        self.mappings_sub_notebook.add(feature_frame, text="Features")
 
-        if hasattr(self, 'feature_frame'):
-            self.feature_frame.destroy()
+        # Treeview for hierarchical features
+        self.feature_tree = ttk.Treeview(feature_frame)
+        self.feature_tree.pack(fill="both", expand=True)
 
-        self.feature_frame = ttk.Frame(self.mappings_tab)
-        self.feature_frame.pack(fill="both", expand=True)
+        # Recursive function to populate tree from database
+        def populate_tree(parent_id=None, parent_row=None):
+            cursor = self.conn.cursor()
+            if parent_row is None:
+                cursor.execute("SELECT id, feature_name FROM feature_mappings WHERE parent_id IS NULL")
+            else:
+                cursor.execute("SELECT id, feature_name FROM feature_mappings WHERE parent_id = ?", (parent_row,))
 
-        feature_tree = self.load_feature_tree()
-
-        self.feature_treeview = ttk.Treeview(self.feature_frame)
-        self.feature_treeview.pack(fill="both", expand=True)
-
-        for general, specifics in feature_tree.items():
-            general_id = self.feature_treeview.insert("", "end", text=general)
-            for specific in specifics:
-                self.feature_treeview.insert(general_id, "end", text=specific)
+            for row_id, name in cursor.fetchall():
+                # Convert parent_id to string for Tkinter, or use "" for top-level
+                tree_parent = str(parent_id) if parent_id else ""
+                item_id = self.feature_tree.insert(tree_parent, "end", text=name, values=(row_id,))
+                populate_tree(item_id, row_id)
 
 
-    def load_feature_tree(self):
-        """
-        Load the feature hierarchy from the database.
-        Returns a dict: {general_category: [specific_features]}
-        """
-        import sqlite3
+        # Fill tree
+        populate_tree()
 
+        # Button frame
+        btn_frame = ttk.Frame(feature_frame)
+        btn_frame.pack(fill="x", pady=6)
+
+        # Control buttons
+        ttk.Button(btn_frame, text="Add Feature", command=self.add_feature).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Edit Feature", command=self.edit_feature).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Insert Between", command=self.insert_between_feature).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Remove Feature", command=self.remove_feature).pack(side="left", padx=4)
+
+    def populate_tree(self):
+        """Populate the feature hierarchy Treeview."""
+        self.feature_tree.delete(*self.feature_tree.get_children())
+        c = self.conn.cursor()
+
+        # Ensure table exists
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS feature_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                feature_name TEXT NOT NULL,
+                parent_id INTEGER,
+                FOREIGN KEY(parent_id) REFERENCES feature_mappings(id)
+            )
+        ''')
+
+        # Load features
+        c.execute("SELECT id, feature_name, parent_id FROM feature_mappings")
+        rows = c.fetchall()
+
+        # Build lookup for hierarchy
+        children = {}
+        for row_id, name, parent_id in rows:
+            children.setdefault(parent_id, []).append((row_id, name))
+
+        def insert_children(parent_id, tree_parent=""):
+            for row_id, name in children.get(parent_id, []):
+                item_id = self.feature_tree.insert(tree_parent, "end", text=name, values=(row_id,))
+                insert_children(row_id, item_id)
+
+        insert_children(None)
+
+    def ensure_feature_table(self):
+        """Ensure the feature_mappings table exists and has proper columns."""
+        c = self.conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS feature_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                feature_name TEXT NOT NULL,
+                parent_id INTEGER,
+                FOREIGN KEY(parent_id) REFERENCES feature_mappings(id)
+            )
+        """)
+        self.conn.commit()
+
+
+    def build_location_tab(self):
+        """Create the hierarchical location tree tab."""
+        location_frame = ttk.Frame(self.mappings_sub_notebook)
+        self.mappings_sub_notebook.add(location_frame, text="Locations")
+
+        self.location_treeview = ttk.Treeview(location_frame)
+        self.location_treeview.pack(fill="both", expand=True)
+
+        # Load all locations from DB
         conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
-
-        c.execute("SELECT specific, general FROM feature_mappings")
+        c.execute("SELECT id, location_name, parent_id FROM location_mappings")
         rows = c.fetchall()
         conn.close()
 
-        feature_tree = {}
-        for specific, general in rows:
-            if general not in feature_tree:
-                feature_tree[general] = []
-            feature_tree[general].append(specific)
+        # Build a parent-child mapping
+        children = {}
+        for loc_id, name, parent_id in rows:
+            children.setdefault(parent_id, []).append((loc_id, name))
 
-        return feature_tree
+        # Recursive function to insert into Treeview
+        def insert_children(parent_id, tree_parent=""):
+            for loc_id, name in children.get(parent_id, []):
+                item_id = self.location_treeview.insert(tree_parent, "end", text=name, values=(loc_id,))
+                insert_children(loc_id, item_id)
+
+        insert_children(None)  # Start from top-level (parent_id is NULL)
+
+        # Buttons
+        btn_frame = ttk.Frame(location_frame)
+        btn_frame.pack(fill="x", pady=6)
+        ttk.Button(btn_frame, text="Add Location", command=self.add_location).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Edit Location", command=self.edit_location).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Remove Location", command=self.remove_location).pack(side="left", padx=4)
+
+
+    def load_feature_tree(self):
+        """Load features into a dictionary for building the tree."""
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT id, feature_name FROM feature_mappings")
+        rows = c.fetchall()
+        conn.close()
+
+        feature_dict = {}
+        for row_id, feature_name, parent_id in rows:
+            feature_dict.setdefault(parent_id, []).append((row_id, feature_name))
+        return feature_dict
 
 
     def add_feature(self):
-        """Add a new feature under a selected parent."""
-        selection = self.feature_tree.selection()
-        parent_id = int(selection[0]) if selection else None
-
-        def save_new():
-            name = name_var.get().strip()
-            general = general_var.get().strip() or name
-            if not name:
-                messagebox.showwarning("Invalid", "Feature name cannot be empty.")
-                return
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("INSERT INTO feature_mappings (name, parent_id, general) VALUES (?, ?, ?)",
-                    (name, parent_id, general))
-            conn.commit()
-            conn.close()
-            self.load_feature_tree()
-            add_win.destroy()
-
+        """Add a new feature with optional parent and child relationships."""
         add_win = tk.Toplevel(self)
         add_win.title("Add Feature")
-        ttk.Label(add_win, text="Feature Name:").grid(row=0, column=0, padx=5, pady=5)
-        name_var = tk.StringVar()
-        ttk.Entry(add_win, textvariable=name_var).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Label(add_win, text="Top-Level Category (optional):").grid(row=1, column=0, padx=5, pady=5)
-        general_var = tk.StringVar()
-        ttk.Entry(add_win, textvariable=general_var).grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(add_win, text="Save", command=save_new).grid(row=2, column=0, columnspan=2, pady=10)
+        add_win.geometry("350x220")
 
+        # Feature name input
+        tk.Label(add_win, text="New Feature Name:").pack(pady=5)
+        name_entry = ttk.Entry(add_win, width=30)
+        name_entry.pack()
+
+        # Fetch existing features
+        c = self.conn.cursor()
+        c.execute("SELECT id, feature_name FROM feature_mappings ORDER BY feature_name")
+        features = c.fetchall()
+        feature_names = ["(None)"] + [f[1] for f in features]
+        feature_ids = [None] + [f[0] for f in features]
+
+        # Parent feature dropdown
+        tk.Label(add_win, text="Parent Feature:").pack(pady=5)
+        parent_var = tk.StringVar(value="(None)")
+        parent_combo = ttk.Combobox(add_win, textvariable=parent_var, values=feature_names, state="readonly")
+        parent_combo.pack()
+
+        # Optional child feature dropdown
+        tk.Label(add_win, text="Child Feature:").pack(pady=5)
+        child_var = tk.StringVar(value="(None)")
+        child_combo = ttk.Combobox(add_win, textvariable=child_var, values=feature_names, state="readonly")
+        child_combo.pack()
+
+        def save_new_feature():
+            feature_name = name_entry.get().strip()
+            if not feature_name:
+                messagebox.showerror("Error", "Feature name cannot be empty.")
+                return
+
+            # Determine parent_id
+            parent_idx = feature_names.index(parent_var.get())
+            parent_id = feature_ids[parent_idx]
+
+            # Insert new feature
+            c = self.conn.cursor()
+            c.execute(
+                "INSERT INTO feature_mappings (feature_name, parent_id) VALUES (?, ?)",
+                (feature_name, parent_id)
+            )
+            new_id = c.lastrowid
+
+            # Update child feature if specified
+            child_idx = feature_names.index(child_var.get())
+            child_id = feature_ids[child_idx]
+            if child_id:
+                c.execute(
+                    "UPDATE feature_mappings SET parent_id=? WHERE id=?",
+                    (new_id, child_id)
+                )
+
+            self.conn.commit()
+            self.populate_tree()
+            add_win.destroy()
+
+        ttk.Button(add_win, text="Save", command=save_new_feature).pack(pady=15)
 
     def edit_feature(self):
-        """Edit the selected feature."""
+        """Edit a selected feature in the hierarchical tree."""
         selection = self.feature_tree.selection()
         if not selection:
             messagebox.showwarning("Select Feature", "Please select a feature to edit.")
             return
-        feature_id = int(selection[0])
 
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT name, general FROM feature_mappings WHERE id=?", (feature_id,))
-        row = c.fetchone()
-        conn.close()
-        if not row:
-            return
+        selected_item = selection[0]
+        feature_name = self.feature_tree.item(selected_item, "text")
+        feature_id = int(self.feature_tree.item(selected_item, "values")[0])
+
+        # Get current parent
+        parent_item = self.feature_tree.parent(selected_item)
+        current_parent_id = None
+        if parent_item:
+            current_parent_id = int(self.feature_tree.item(parent_item, "values")[0])
+
+        # Build list of possible parents
+        c = self.conn.cursor()
+        c.execute("SELECT id, feature_name FROM feature_mappings WHERE id != ?", (feature_id,))
+        rows = c.fetchall()
+        parent_options = ["(None)"] + [row[1] for row in rows]
+        parent_ids = [None] + [int(row[0]) for row in rows]
+
+        # Build edit window
+        edit_win = tk.Toplevel(self)
+        edit_win.title("Edit Feature")
+        edit_win.geometry("350x150")
+
+        ttk.Label(edit_win, text="Feature Name:").pack(pady=5)
+        name_var = tk.StringVar(value=feature_name)
+        ttk.Entry(edit_win, textvariable=name_var).pack()
+
+        ttk.Label(edit_win, text="Parent Feature:").pack(pady=5)
+        parent_var = tk.StringVar()
+        parent_combo = ttk.Combobox(edit_win, textvariable=parent_var, values=parent_options, state="readonly")
+        parent_combo.pack()
+
+        # Preselect current parent safely
+        if current_parent_id and current_parent_id in parent_ids:
+            parent_combo.current(parent_ids.index(current_parent_id))
+        else:
+            parent_combo.current(0)
 
         def save_edit():
             new_name = name_var.get().strip()
-            new_general = general_var.get().strip() or new_name
-            if not new_name:
-                messagebox.showwarning("Invalid", "Feature name cannot be empty.")
-                return
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("UPDATE feature_mappings SET name=?, general=? WHERE id=?", (new_name, new_general, feature_id))
-            conn.commit()
-            conn.close()
-            self.load_feature_tree()
-            edit_win.destroy()
+            parent_idx = parent_combo.current()
+            new_parent_id = parent_ids[parent_idx]
 
-        edit_win = tk.Toplevel(self)
-        edit_win.title("Edit Feature")
-        ttk.Label(edit_win, text="Feature Name:").grid(row=0, column=0, padx=5, pady=5)
-        name_var = tk.StringVar(value=row[0])
-        ttk.Entry(edit_win, textvariable=name_var).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Label(edit_win, text="Top-Level Category (optional):").grid(row=1, column=0, padx=5, pady=5)
-        general_var = tk.StringVar(value=row[1])
-        ttk.Entry(edit_win, textvariable=general_var).grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(edit_win, text="Save", command=save_edit).grid(row=2, column=0, columnspan=2, pady=10)
+            if not new_name:
+                messagebox.showerror("Error", "Feature name cannot be empty.")
+                return
+
+            try:
+                c = self.conn.cursor()
+                c.execute(
+                    "UPDATE feature_mappings SET feature_name=?, parent_id=? WHERE id=?",
+                    (new_name, new_parent_id, feature_id)
+                )
+                self.conn.commit()
+                self.refresh_feature_tree()
+                edit_win.destroy()
+            except Exception as e:
+                messagebox.showerror("Database Error", f"Error updating feature:\n{e}")
+
+        ttk.Button(edit_win, text="Save", command=save_edit).pack(pady=10)
+
+    def insert_between_feature(self):
+        """Insert a new feature between two existing ones in the hierarchy."""
+        selected = self.feature_tree.selection()
+        if not selected:
+            messagebox.showwarning("No selection", "Select a feature to insert after.")
+            return
+
+        # Get the parent and index position
+        selected_item = selected[0]
+        parent_item = self.feature_tree.parent(selected_item)
+        index = self.feature_tree.index(selected_item)
+
+        # Ask for the new feature name
+        new_name = simpledialog.askstring("Insert Feature", "Enter new feature name:")
+        if not new_name:
+            return
+
+        # Insert it visually in the Treeview
+        new_item = self.feature_tree.insert(parent_item, index + 1, text=new_name)
+
+        # Insert into the database
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        try:
+            # Get parent_id from Treeview item values
+            parent_id = None
+            if parent_item:
+                parent_id = self.feature_tree.item(parent_item, "values")
+                if parent_id:
+                    parent_id = parent_id[0]  # Treeview stores values as a tuple
+
+            c.execute(
+                "INSERT INTO feature_mappings (feature_name, parent_id) VALUES (?, ?)",
+                (new_name, parent_id)
+            )
+            conn.commit()
+
+            # Update Treeview item with DB id
+            new_id = c.lastrowid
+            self.feature_tree.item(new_item, values=(new_id,))
+        except Exception as e:
+            messagebox.showerror("Database Error", f"Error inserting feature:\n{e}")
+        finally:
+            conn.close()
 
 
     def remove_feature(self):
-        """Remove a feature and all its children recursively."""
+        """Remove a selected feature and its children."""
         selection = self.feature_tree.selection()
         if not selection:
             messagebox.showwarning("Select Feature", "Please select a feature to remove.")
             return
-        feature_id = int(selection[0])
-        if not messagebox.askyesno("Confirm Delete", "Delete this feature and all sub-features?"):
+
+        selected_item = selection[0]
+        feature_id = self.feature_tree.item(selected_item, "values")[0]
+
+        confirm = messagebox.askyesno("Confirm Delete", "Are you sure you want to delete this feature and all its sub-features?")
+        if not confirm:
             return
-
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-
-        def delete_recursive(fid):
-            c.execute("SELECT id FROM feature_mappings WHERE parent_id=?", (fid,))
-            for (child_id,) in c.fetchall():
-                delete_recursive(child_id)
-            c.execute("DELETE FROM feature_mappings WHERE id=?", (fid,))
-
-        delete_recursive(feature_id)
-        conn.commit()
-        conn.close()
-        self.load_feature_tree()
-
-
-    # --- Location Mappings Sub-tab ---
-    def build_location_tab(self):
-        import tkinter as tk
-        from tkinter import ttk
-
-        if hasattr(self, 'location_frame'):
-            self.location_frame.destroy()
-
-        self.location_frame = ttk.Frame(self.mappings_tab)
-        self.location_frame.pack(fill="both", expand=True)
-
-        location_tree = self.load_location_tree()
-
-        self.location_treeview = ttk.Treeview(self.location_frame)
-        self.location_treeview.pack(fill="both", expand=True)
-
-        for general, specifics in location_tree.items():
-            general_id = self.location_treeview.insert("", "end", text=general)
-            for specific in specifics:
-                self.location_treeview.insert(general_id, "end", text=specific)
-
-
-    def load_location_tree(self):
-        """
-        Load the location hierarchy from the database.
-        Returns a dict: {general_location: [specific_locations]}
-        """
-        import sqlite3
 
         conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
 
-        c.execute("SELECT specific, general FROM location_mappings")
-        rows = c.fetchall()
+        # Recursive delete function to remove children first
+        def delete_feature_recursive(fid):
+            # Find children
+            c.execute("SELECT id FROM feature_mappings WHERE parent_id=?", (fid,))
+            child_ids = [row[0] for row in c.fetchall()]
+            for child_id in child_ids:
+                delete_feature_recursive(child_id)
+            # Delete this feature
+            c.execute("DELETE FROM feature_mappings WHERE id=?", (fid,))
+
+        try:
+            delete_feature_recursive(feature_id)
+            conn.commit()
+            self.refresh_feature_tree()
+        except Exception as e:
+            messagebox.showerror("Database Error", f"Error deleting feature:\n{e}")
+        finally:
+            conn.close()
+
+
+    def refresh_feature_tree(self):
+        """Rebuild the hierarchical feature tree from existing table."""
+        self.feature_tree.delete(*self.feature_tree.get_children())
+        c = self.conn.cursor()
+
+        try:
+            # Fetch all features
+            c.execute("SELECT id, feature_name, parent_id FROM feature_mappings")
+            rows = c.fetchall()
+        except sqlite3.OperationalError as e:
+            print("Database error:", e)
+            return
+
+        # Build a parent -> children mapping
+        children = {}
+        feature_names = {}
+        for fid, name, parent_id in rows:
+            children.setdefault(parent_id, []).append(fid)
+            feature_names[fid] = name
+
+        # Recursive function to insert tree nodes
+        def insert_children(parent_id, tree_parent=""):
+            for fid in children.get(parent_id, []):
+                name = feature_names[fid]
+                item_id = self.feature_tree.insert(tree_parent, "end", text=name, values=(fid,))
+                insert_children(fid, item_id)
+
+        # Start inserting from top-level (parent_id is None)
+        insert_children(None)
+
+    # --- Location Mappings Sub-tab ---
+   
+    def load_location_tree(self):
+        """
+        Load the location hierarchy from the database using the new schema.
+        Returns a dict: {parent_id: [child_id, ...]} and a mapping of id -> name.
+        """
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+
+        try:
+            c.execute("SELECT id, location_name, parent_id FROM location_mappings")
+            rows = c.fetchall()
+        except sqlite3.OperationalError as e:
+            print("Database error:", e)
+            conn.close()
+            return {}
+
         conn.close()
 
-        location_tree = {}
-        for specific, general in rows:
-            if general not in location_tree:
-                location_tree[general] = []
-            location_tree[general].append(specific)
+        # Build parent -> children mapping
+        children = {}
+        location_names = {}
+        for loc_id, name, parent_id in rows:
+            children.setdefault(parent_id, []).append(loc_id)
+            location_names[loc_id] = name
 
-        return location_tree
+        # Recursive function to build tree dict
+        tree = {}
+
+        def insert_children(parent_id, parent_name=None):
+            for loc_id in children.get(parent_id, []):
+                name = location_names[loc_id]
+                if parent_name is None:
+                    tree[name] = []
+                    insert_children(loc_id, name)
+                else:
+                    tree[parent_name].append(name)
+                    insert_children(loc_id, name)
+
+        insert_children(None)  # Start from top-level locations
+        return tree
 
 
     def add_location(self):
@@ -1443,6 +1683,7 @@ def main():
         sys.exit(0)
 
     app = PlantPhotoManager(DB_FILE)
+    init_db_at(DB_FILE)
     app.mainloop()
     print("[DEBUG] Tk root created.")
 
