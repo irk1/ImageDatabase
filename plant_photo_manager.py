@@ -154,13 +154,16 @@ def init_db_at(db_path):
         )
     ''')
 
-    # Location Mappings table
+   # Location Mappings table (hierarchical structure)
     c.execute('''
         CREATE TABLE IF NOT EXISTS location_mappings (
-            location_name TEXT PRIMARY KEY,
-            general TEXT
-        )
-    ''')
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location_name TEXT NOT NULL,
+            parent_id INTEGER,
+            FOREIGN KEY (parent_id) REFERENCES location_mappings(id)
+    )
+''')
+
 
     conn.commit()
     conn.close()
@@ -209,11 +212,13 @@ def init_db_if_missing(db_path):
         )
     ''')
 
-    # Location mappings table (unchanged)
+    # Location mappings table (hierarchical)
     c.execute('''
         CREATE TABLE IF NOT EXISTS location_mappings (
-            location_name TEXT PRIMARY KEY,
-            general TEXT
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location_name TEXT NOT NULL,
+            parent_id INTEGER,
+            FOREIGN KEY (parent_id) REFERENCES location_mappings(id)
         )
     ''')
 
@@ -275,45 +280,90 @@ def load_specific_mappings(db_file):
 
     return FEATURE_MAP, LOCATION_MAP
 
+def load_location_mappings(db_file):
+    """Load hierarchical location mappings into dictionaries for use elsewhere."""
+    conn = sqlite3.connect(db_file)
+    c = conn.cursor()
+
+    # Ensure the table exists before querying
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS location_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location_name TEXT NOT NULL,
+            parent_id INTEGER,
+            FOREIGN KEY (parent_id) REFERENCES location_mappings(id)
+        )
+    """)
+    conn.commit()
+
+    # Now safe to query
+    c.execute("SELECT id, location_name, parent_id FROM location_mappings")
+    rows = c.fetchall()
+    conn.close()
+
+    # Build in-memory maps
+    LOCATION_MAP = {}
+    LOCATION_CHILDREN = {}
+
+    for row_id, location_name, parent_id in rows:
+        LOCATION_MAP[row_id] = parent_id
+        if parent_id is not None:
+            LOCATION_CHILDREN.setdefault(parent_id, []).append(row_id)
+
+    return LOCATION_MAP, LOCATION_CHILDREN
+
 
 def ensure_db():
+    """Ensure all required tables exist in the database."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+
+    # Photos table
     c.execute("""
-    CREATE TABLE IF NOT EXISTS photos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        species TEXT,
-        species_code TEXT,
-        gfib_link TEXT,
-        main_feature TEXT,
-        feature_code TEXT,
-        date_taken TEXT,
-        used_topaz INTEGER,
-        subject_size TEXT,
-        other_features TEXT,
-        location TEXT,
-        location_code TEXT,
-        processed_filename TEXT,
-        processed_path TEXT,
-        raw_attached INTEGER,
-        raw_paths TEXT,
-        raw_mode TEXT,
-        created_at TEXT
-    )""")
+        CREATE TABLE IF NOT EXISTS photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            species TEXT,
+            species_code TEXT,
+            gfib_link TEXT,
+            main_feature TEXT,
+            feature_code TEXT,
+            date_taken TEXT,
+            used_topaz INTEGER,
+            subject_size TEXT,
+            other_features TEXT,
+            location TEXT,
+            location_code TEXT,
+            processed_filename TEXT,
+            processed_path TEXT,
+            raw_attached INTEGER,
+            raw_paths TEXT,
+            raw_mode TEXT,
+            created_at TEXT
+        )
+    """)
+
+    # Feature mappings table
     c.execute("""
-    CREATE TABLE IF NOT EXISTS feature_mappings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        feature_name TEXT NOT NULL,
-        parent_id INTEGER,
-        general TEXT
-    )""")
+        CREATE TABLE IF NOT EXISTS feature_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feature_name TEXT NOT NULL,
+            parent_id INTEGER,
+            general TEXT,
+            FOREIGN KEY (parent_id) REFERENCES feature_mappings(id)
+        )
+    """)
+
+    # Location mappings table
     c.execute("""
-    CREATE TABLE IF NOT EXISTS location_mappings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        location_name TEXT NOT NULL,
-        parent_id INTEGER,
-        general TEXT
-    )""")
+        CREATE TABLE IF NOT EXISTS location_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location_name TEXT NOT NULL,
+            parent_id INTEGER,
+            general TEXT,
+            FOREIGN KEY (parent_id) REFERENCES location_mappings(id)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -401,26 +451,63 @@ class PlantPhotoManager(tk.Tk):
             return []
 
     
-    def load_mappings_async(self):
-        """
-        Loads FEATURE_MAP and LOCATION_MAP in a background thread safely.
-        Updates GUI via self.after().
-        """
-        import threading
+    def load_location_mappings(db_file):
+        """Load hierarchical location mappings into a dictionary."""
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
 
-        def loader():
-            global FEATURE_MAP, LOCATION_MAP
-            FEATURE_MAP, LOCATION_MAP = load_specific_mappings(DB_FILE)
-            self.after(0, self.refresh_autocomplete)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS location_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                location_name TEXT NOT NULL,
+                parent_id INTEGER,
+                general TEXT
+            )
+        """)
+        conn.commit()
 
-        threading.Thread(target=loader, daemon=True).start()
+        c.execute("SELECT id, location_name, parent_id FROM location_mappings")
+        rows = c.fetchall()
+        conn.close()
+
+        LOCATION_MAP = {}
+        for row_id, loc_name, parent_id in rows:
+            LOCATION_MAP[row_id] = parent_id
+
+        return LOCATION_MAP
 
     def refresh_autocomplete(self):
         """Refresh all autocomplete comboboxes in Add tab after mappings are loaded."""
         for varname in ("species_var", "feature_var", "size_var", "other_var", "loc_var"):
             cb = getattr(self, varname + "_combobox", None)
-            if cb:
-                cb['values'] = self.get_previous_values(varname)
+            if not cb:
+                continue
+
+            if varname == "feature_var":
+                # Pull from hierarchical feature_mappings
+                try:
+                    conn = sqlite3.connect(DB_FILE)
+                    c = conn.cursor()
+                    c.execute("SELECT DISTINCT feature_name FROM feature_mappings ORDER BY feature_name")
+                    values = [r[0] for r in c.fetchall()]
+                    conn.close()
+                except Exception:
+                    values = []
+            elif varname == "loc_var":
+                # Pull from hierarchical location_mappings
+                try:
+                    conn = sqlite3.connect(DB_FILE)
+                    c = conn.cursor()
+                    c.execute("SELECT DISTINCT location_name FROM location_mappings ORDER BY location_name")
+                    values = [r[0] for r in c.fetchall()]
+                    conn.close()
+                except Exception:
+                    values = []
+            else:
+                # Use the fallback (photos table history)
+                values = self.get_previous_values(varname)
+
+            cb["values"] = sorted(set(values))  # remove duplicates and sort
 
     def setup_widgets(self):
         # Use self.notebook instead of a local variable
@@ -770,7 +857,7 @@ class PlantPhotoManager(tk.Tk):
         """Load features into a dictionary for building the tree."""
         conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
-        c.execute("SELECT id, feature_name FROM feature_mappings")
+        c.execute("SELECT id, feature_name, parent_id FROM feature_mappings")
         rows = c.fetchall()
         conn.close()
 
@@ -1025,131 +1112,166 @@ class PlantPhotoManager(tk.Tk):
 
     # --- Location Mappings Sub-tab ---
    
-    def load_location_tree(self):
-        """
-        Load the location hierarchy from the database using the new schema.
-        Returns a dict: {parent_id: [child_id, ...]} and a mapping of id -> name.
-        """
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-
-        try:
-            c.execute("SELECT id, location_name, parent_id FROM location_mappings")
-            rows = c.fetchall()
-        except sqlite3.OperationalError as e:
-            print("Database error:", e)
-            conn.close()
-            return {}
-
-        conn.close()
-
-        # Build parent -> children mapping
-        children = {}
-        location_names = {}
-        for loc_id, name, parent_id in rows:
-            children.setdefault(parent_id, []).append(loc_id)
-            location_names[loc_id] = name
-
-        # Recursive function to build tree dict
-        tree = {}
-
-        def insert_children(parent_id, parent_name=None):
-            for loc_id in children.get(parent_id, []):
-                name = location_names[loc_id]
-                if parent_name is None:
-                    tree[name] = []
-                    insert_children(loc_id, name)
-                else:
-                    tree[parent_name].append(name)
-                    insert_children(loc_id, name)
-
-        insert_children(None)  # Start from top-level locations
-        return tree
-
-
     def add_location(self):
-        """Add a new location under a selected parent."""
-        selection = self.location_tree.selection()
-        parent_id = int(selection[0]) if selection else None
-
-        def save_new():
-            name = name_var.get().strip()
-            general = general_var.get().strip() or name
-            if not name:
-                messagebox.showwarning("Invalid", "Location name cannot be empty.")
-                return
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("INSERT INTO location_mappings (name, parent_id, general) VALUES (?, ?, ?)",
-                    (name, parent_id, general))
-            conn.commit()
-            conn.close()
-            self.load_location_tree()
-            add_win.destroy()
-
+        """Add a new location, with optional parent selection (same behavior as feature popup)."""
         add_win = tk.Toplevel(self)
         add_win.title("Add Location")
-        ttk.Label(add_win, text="Location Name:").grid(row=0, column=0, padx=5, pady=5)
+        add_win.geometry("350x150")
+
+        # Fetch possible parents
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT id, location_name FROM location_mappings ORDER BY location_name COLLATE NOCASE")
+        rows = c.fetchall()
+        conn.close()
+
+        parent_options = ["(None)"] + [r[1] for r in rows]
+        parent_ids = [None] + [r[0] for r in rows]
+
+        # --- UI ---
+        ttk.Label(add_win, text="Location Name:").pack(pady=5)
         name_var = tk.StringVar()
-        ttk.Entry(add_win, textvariable=name_var).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Label(add_win, text="Top-Level Category (optional):").grid(row=1, column=0, padx=5, pady=5)
-        general_var = tk.StringVar()
-        ttk.Entry(add_win, textvariable=general_var).grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(add_win, text="Save", command=save_new).grid(row=2, column=0, columnspan=2, pady=10)
+        ttk.Entry(add_win, textvariable=name_var).pack()
+
+        ttk.Label(add_win, text="Parent Location:").pack(pady=5)
+        parent_var = tk.StringVar()
+        parent_combo = ttk.Combobox(add_win, textvariable=parent_var, values=parent_options, state="readonly")
+        parent_combo.pack()
+        parent_combo.current(0)
+
+        def save_new():
+            new_name = name_var.get().strip()
+            parent_idx = parent_combo.current()
+            parent_id = parent_ids[parent_idx]
+
+            if not new_name:
+                messagebox.showerror("Error", "Location name cannot be empty.")
+                return
+
+            try:
+                conn = sqlite3.connect(self.db_file)
+                c = conn.cursor()
+                c.execute(
+                    "INSERT INTO location_mappings (location_name, parent_id) VALUES (?, ?)",
+                    (new_name, parent_id)
+                )
+                conn.commit()
+                conn.close()
+                self.refresh_location_treeview()
+                add_win.destroy()
+            except Exception as e:
+                messagebox.showerror("Database Error", f"Error adding location:\n{e}")
+
+        ttk.Button(add_win, text="Save", command=save_new).pack(pady=10)
+
+
+    def refresh_location_treeview(self):
+        """Rebuild the location treeview after add/edit/remove."""
+        for item in self.location_treeview.get_children():
+            self.location_treeview.delete(item)
+
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT id, location_name, parent_id FROM location_mappings")
+        rows = c.fetchall()
+        conn.close()
+
+        children = {}
+        for loc_id, name, parent_id in rows:
+            children.setdefault(parent_id, []).append((loc_id, name))
+
+        def insert_children(parent_id, tree_parent=""):
+            for loc_id, name in children.get(parent_id, []):
+                item_id = self.location_treeview.insert(tree_parent, "end", text=name, values=(loc_id,))
+                insert_children(loc_id, item_id)
+
+        insert_children(None)
 
 
     def edit_location(self):
-        """Edit the selected location."""
-        selection = self.location_tree.selection()
+        """Edit a selected location, same behavior as feature edit popup."""
+        selection = self.location_treeview.selection()
         if not selection:
             messagebox.showwarning("Select Location", "Please select a location to edit.")
             return
-        loc_id = int(selection[0])
 
-        conn = sqlite3.connect(DB_FILE)
+        selected_item = selection[0]
+        loc_name = self.location_treeview.item(selected_item, "text")
+        loc_id = self.location_treeview.item(selected_item, "values")[0]
+
+        # Get current parent
+        parent_item = self.location_treeview.parent(selected_item)
+        current_parent_id = None
+        if parent_item:
+            current_parent_id = self.location_treeview.item(parent_item, "values")[0]
+
+        # Build list of possible parents
+        conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
-        c.execute("SELECT name, general FROM location_mappings WHERE id=?", (loc_id,))
-        row = c.fetchone()
+        c.execute("SELECT id, location_name FROM location_mappings WHERE id != ?", (loc_id,))
+        rows = c.fetchall()
         conn.close()
-        if not row:
-            return
 
-        def save_edit():
-            new_name = name_var.get().strip()
-            new_general = general_var.get().strip() or new_name
-            if not new_name:
-                messagebox.showwarning("Invalid", "Location name cannot be empty.")
-                return
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("UPDATE location_mappings SET name=?, general=? WHERE id=?", (new_name, new_general, loc_id))
-            conn.commit()
-            conn.close()
-            self.load_location_tree()
-            edit_win.destroy()
+        parent_options = ["(None)"] + [r[1] for r in rows]
+        parent_ids = [None] + [r[0] for r in rows]
 
         edit_win = tk.Toplevel(self)
         edit_win.title("Edit Location")
-        ttk.Label(edit_win, text="Location Name:").grid(row=0, column=0, padx=5, pady=5)
-        name_var = tk.StringVar(value=row[0])
-        ttk.Entry(edit_win, textvariable=name_var).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Label(edit_win, text="Top-Level Category (optional):").grid(row=1, column=0, padx=5, pady=5)
-        general_var = tk.StringVar(value=row[1])
-        ttk.Entry(edit_win, textvariable=general_var).grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(edit_win, text="Save", command=save_edit).grid(row=2, column=0, columnspan=2, pady=10)
+        edit_win.geometry("350x150")
+
+        ttk.Label(edit_win, text="Location Name:").pack(pady=5)
+        name_var = tk.StringVar(value=loc_name)
+        ttk.Entry(edit_win, textvariable=name_var).pack()
+
+        ttk.Label(edit_win, text="Parent Location:").pack(pady=5)
+        parent_var = tk.StringVar()
+        parent_combo = ttk.Combobox(edit_win, textvariable=parent_var, values=parent_options, state="readonly")
+        parent_combo.pack()
+        # Set current parent
+        if current_parent_id:
+            parent_combo.current(parent_ids.index(current_parent_id))
+        else:
+            parent_combo.current(0)
+
+        def save_edit():
+            new_name = name_var.get().strip()
+            parent_idx = parent_combo.current()
+            new_parent_id = parent_ids[parent_idx]
+
+            if not new_name:
+                messagebox.showerror("Error", "Location name cannot be empty.")
+                return
+
+            try:
+                conn = sqlite3.connect(self.db_file)
+                c = conn.cursor()
+                c.execute(
+                    "UPDATE location_mappings SET location_name=?, parent_id=? WHERE id=?",
+                    (new_name, new_parent_id, loc_id)
+                )
+                conn.commit()
+                conn.close()
+                self.refresh_location_treeview()
+                edit_win.destroy()
+            except Exception as e:
+                messagebox.showerror("Database Error", f"Error updating location:\n{e}")
+
+        ttk.Button(edit_win, text="Save", command=save_edit).pack(pady=10)
 
 
     def remove_location(self):
         """Remove a location and all its children recursively."""
-        selection = self.location_tree.selection()
+        selection = self.location_treeview.selection()
         if not selection:
             messagebox.showwarning("Select Location", "Please select a location to remove.")
             return
-        loc_id = int(selection[0])
+
+        loc_id = self.location_treeview.item(selection[0], "values")[0]
+
         if not messagebox.askyesno("Confirm Delete", "Delete this location and all sub-locations?"):
             return
 
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
 
         def delete_recursive(lid):
@@ -1161,7 +1283,7 @@ class PlantPhotoManager(tk.Tk):
         delete_recursive(loc_id)
         conn.commit()
         conn.close()
-        self.load_location_tree()
+        self.refresh_location_treeview()
 
     def search_entries(self):
         """Search the database for matching entries based on the search fields."""
