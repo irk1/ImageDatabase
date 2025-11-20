@@ -16,11 +16,12 @@ import datetime
 import re
 import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog, messagebox
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import sys
 import platform
 import subprocess
 import threading
+from tkinterdnd2 import TkinterDnD
 
 # -------------------------
 # Configuration / Folders
@@ -29,7 +30,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROCESSED_DIR = os.path.join(APP_DIR, "processed")
 RAW_DIR = os.path.join(APP_DIR, "raw")
 THUMB_SIZE = (320, 240)
-
+Image.MAX_IMAGE_PIXELS = 1000000000   # Allow up to 1 billion pixels
 
 # -------------------------
 # Utility functions
@@ -89,7 +90,6 @@ def open_path(path):
 # Database file selection and initialization
 # -------------------------
 
-import threading
 
 DEFAULT_DB_FILE = os.path.join(APP_DIR, "plant_photos.db")
 
@@ -312,6 +312,9 @@ def load_location_mappings(db_file):
 
     return LOCATION_MAP, LOCATION_CHILDREN
 
+def column_exists(cursor, table, column):
+    cursor.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in cursor.fetchall())
 
 def ensure_db():
     """Ensure all required tables exist in the database."""
@@ -338,7 +341,8 @@ def ensure_db():
             raw_attached INTEGER,
             raw_paths TEXT,
             raw_mode TEXT,
-            created_at TEXT
+            created_at TEXT,
+            watermark_enabled INTEGER DEFAULT 1
         )
     """)
 
@@ -364,6 +368,11 @@ def ensure_db():
         )
     """)
 
+    # Add watermark column safely
+    if not column_exists(c, "photos", "watermark_enabled"):
+        c.execute("ALTER TABLE photos ADD COLUMN watermark_enabled INTEGER DEFAULT 1")
+
+
     conn.commit()
     conn.close()
 
@@ -388,7 +397,7 @@ FEATURE_MAP, LOCATION_MAP = {}, {}
 # -------------------------
 # GUI Application
 # -------------------------
-class PlantPhotoManager(tk.Tk):
+class PlantPhotoManager(TkinterDnD.Tk):
     def __init__(self, db_file):
         print("[DEBUG] Initializing PlantPhotoManager...")
         super().__init__()
@@ -561,20 +570,25 @@ class PlantPhotoManager(tk.Tk):
         left.pack(side="left", fill="y", padx=(8, 4))
         right.pack(side="left", fill="both", expand=True, padx=(4, 8))
 
-        # Processed image selector
+        # --- Processed Image ---
         ttk.Label(left, text="Processed image (required)").grid(row=0, column=0, sticky="w")
         self.proc_path_var = tk.StringVar()
-        ttk.Entry(left, textvariable=self.proc_path_var, width=46).grid(row=1, column=0, sticky="w")
+        self.proc_entry = ttk.Entry(left, textvariable=self.proc_path_var, width=46)
+        self.proc_entry.grid(row=1, column=0, sticky="w")
+        self.proc_entry.drop_target_register('*')
+        self.proc_entry.dnd_bind('<<Drop>>', self.handle_drop_processed)
         ttk.Button(left, text="Browse...", command=self.browse_processed).grid(row=1, column=1, padx=6)
 
-        # Raw file attach
+        # --- Raw Files ---
         ttk.Label(left, text="Attach raw file(s) (optional)").grid(row=2, column=0, sticky="w", pady=(10, 0))
         self.raw_listbox = tk.Listbox(left, height=5, width=60)
         self.raw_listbox.grid(row=3, column=0, columnspan=2, sticky="w")
+        self.raw_listbox.drop_target_register('*')
+        self.raw_listbox.dnd_bind('<<Drop>>', self.handle_drop_raw)
         ttk.Button(left, text="Add Raw Files...", command=self.browse_raw).grid(row=4, column=0, pady=6, sticky="w")
         ttk.Button(left, text="Remove Selected Raw", command=self.remove_selected_raw).grid(row=4, column=1, pady=6, sticky="w")
 
-        # Option: copy raw or reference (tk.Checkbutton supports wraplength)
+        # Copy or reference raw
         self.copy_raw_var = tk.IntVar(value=1)
         tk.Checkbutton(
             left,
@@ -586,8 +600,16 @@ class PlantPhotoManager(tk.Tk):
             padx=4
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
-        # Metadata fields with autocomplete
-        row = 6
+        # Watermark checkbox
+        self.watermark_var = tk.IntVar(value=1)
+        ttk.Checkbutton(
+            left,
+            text="Embed copyright watermark on processed image",
+            variable=self.watermark_var
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # --- Metadata fields ---
+        row = 7
         def mk_entry(label_text, varname, autocomplete=True):
             nonlocal row
             setattr(self, varname, tk.StringVar())
@@ -612,24 +634,27 @@ class PlantPhotoManager(tk.Tk):
         mk_entry("Other visible features (comma sep)", "other_var")
         mk_entry("Location (greenhouse, wild...)", "loc_var")
 
+        # Topaz AI checkbox
         self.topaz_var = tk.IntVar(value=0)
         ttk.Checkbutton(left, text="Processed with Topaz AI", variable=self.topaz_var).grid(row=row, column=0, sticky="w", pady=8)
         row += 1
 
-        # Filename preview + actions
+        # Filename preview
         ttk.Label(left, text="Generated filename preview").grid(row=row, column=0, sticky="w")
         self.preview_var = tk.StringVar()
         ttk.Entry(left, textvariable=self.preview_var, width=46, state="readonly").grid(row=row+1, column=0, columnspan=2, sticky="w")
         ttk.Button(left, text="Generate Preview", command=self.update_preview).grid(row=row+1, column=1, padx=6)
         row += 2
 
+        # Save / Clear buttons
         ttk.Button(left, text="Save Entry (Copy files & write DB)", command=self.save_entry).grid(row=row, column=0, pady=12, sticky="w")
         ttk.Button(left, text="Clear", command=self.clear_add_form).grid(row=row, column=1, pady=12, sticky="e")
 
-        # Right: thumbnail, attached raw list, and notes
+        # --- Right side: thumbnail + raw files + notes ---
         ttk.Label(right, text="Processed Image Preview").pack(anchor="w")
         self.thumb_label = ttk.Label(right)
         self.thumb_label.pack(pady=6)
+
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(right, text="Attached raw files").pack(anchor="w")
         self.raw_files_text = tk.Text(right, height=8, wrap="word")
@@ -1356,6 +1381,23 @@ class PlantPhotoManager(tk.Tk):
         if file:
             self.edit_processed_var.set(file)
 
+    def handle_drop_processed(self, event):
+        # event.data may have braces around the path, remove them
+        path = event.data.strip("{}")
+        self.proc_path_var.set(path)
+        self.show_thumbnail(path)
+
+    def handle_drop_raw(self, event):
+        paths = self.tk.splitlist(event.data)  # splits multiple paths
+        for p in paths:
+            if p not in self.raw_listbox.get(0, tk.END):
+                self.raw_listbox.insert(tk.END, p)
+        # update text preview
+        self.raw_files_text.delete("1.0", tk.END)
+        for p in self.raw_listbox.get(0, tk.END):
+            self.raw_files_text.insert(tk.END, p + "\n")
+
+
     def save_edited_entry(self):
         """Save the edited metadata and file paths back to the database."""
         if not hasattr(self, "current_edit_id"):
@@ -1466,12 +1508,22 @@ class PlantPhotoManager(tk.Tk):
     def save_entry(self):
         """
         Safely saves the current entry to the database.
+        Adds watermark to processed image if enabled.
         """
         proc_path = self.proc_path_var.get()
         if not proc_path or not os.path.exists(proc_path):
             messagebox.showerror("Error", "Processed image path is invalid or missing.")
             return
 
+        # --- NEW: Apply watermark if checkbox selected ---
+        if self.watermark_var.get() == 1:
+            try:
+                self.apply_watermark(proc_path)
+            except Exception as e:
+                messagebox.showerror("Watermark Error", f"Failed to apply watermark:\n{e}")
+                return
+
+        # --- Write entry to DB ---
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         try:
@@ -1479,8 +1531,8 @@ class PlantPhotoManager(tk.Tk):
                         (species, species_code, gfib_link, main_feature, feature_code,
                         date_taken, used_topaz, subject_size, other_features,
                         location, location_code, processed_filename, processed_path,
-                        raw_attached, raw_paths, raw_mode, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        raw_attached, raw_paths, raw_mode, created_at, watermark_enabled)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (self.species_var.get(),
                     self.species_var.get().upper(),
                     self.gfib_var.get(),
@@ -1497,7 +1549,8 @@ class PlantPhotoManager(tk.Tk):
                     1 if self.raw_listbox.size() > 0 else 0,
                     ",".join(self.raw_listbox.get(0, tk.END)),
                     "copy" if self.copy_raw_var.get() else "link",
-                    datetime.now().isoformat()
+                    datetime.now().isoformat(),
+                    self.watermark_var.get()
                     ))
             conn.commit()
             messagebox.showinfo("Success", "Entry saved successfully!")
@@ -1517,6 +1570,45 @@ class PlantPhotoManager(tk.Tk):
         self.thumb_label.configure(image="", text="")
         self.note_preview.delete("1.0", "end")
         self.copy_raw_var.set(1)
+
+    def apply_watermark(self, image_path):
+        """Draws the copyright watermark onto the processed image."""
+        from PIL import Image, ImageDraw, ImageFont
+
+        img = Image.open(image_path).convert("RGBA")
+        draw = ImageDraw.Draw(img)
+
+        text = "© 2025 Isaac Kriegsman  •  KriegsmanArts.com\nAll rights reserved."
+
+        # Pick font size based on image height
+        font_size = max(18, img.height // 45)
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except:
+            font = ImageFont.load_default()
+
+        # Measure text
+        w, h = draw.multiline_textsize(text, font=font)
+
+        # Padding
+        pad = 10
+        box = (pad, img.height - h - pad * 2)
+
+        # White rectangle
+        draw.rectangle(
+            [box[0], box[1], box[0] + w + pad * 2, box[1] + h + pad * 2],
+            fill="white"
+        )
+
+        # Black text
+        draw.multiline_text(
+            (box[0] + pad, box[1] + pad),
+            text,
+            fill="black",
+            font=font
+        )
+
+        img.save(image_path)
 
 
 
