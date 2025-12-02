@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 import hashlib
 import csv
-import datetime
+from datetime import datetime
 import re
 import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog, messagebox
@@ -62,7 +62,7 @@ def gen_compact_filename(species, date_taken, feat=None, loc=None, used_topaz=Fa
     topaz_tag = "_T" if used_topaz else ""
     orig_tag = f"_{original_name}" if original_name else ""
     
-    fname = f"{spec_code}{feat_code}{locc}_{date_str}{topaz_tag}{orig_tag}.jpg"
+    fname = f"{spec_code}{feat_code}{locc}_{date_str}{topaz_tag}{orig_tag}"
 
     return fname, spec_code, feat_code, locc
 
@@ -1487,43 +1487,134 @@ class PlantPhotoManager(TkinterDnD.Tk):
             self.thumb_label.configure(image="", text=f"Preview not available\n{e}")
 
     def update_preview(self):
-        """
-        Updates the image preview safely.
-        """
-        path = self.proc_path_var.get()
-        if not path or not os.path.exists(path):
-            # Clear the preview if file missing
-            self.preview_label.config(image='')
-            return
+        """Update the filename preview text field only."""
+        from datetime import datetime
 
+        # Parse date
+        date_taken = self.date_var.get().strip()
         try:
-            from PIL import Image, ImageTk
-            img = Image.open(path)
-            img.thumbnail((250, 250))
-            self.preview_img = ImageTk.PhotoImage(img)
-            self.preview_label.config(image=self.preview_img)
-        except Exception as e:
-            messagebox.showerror("Preview Error", f"Could not load image:\n{e}")
+            dt = datetime.strptime(date_taken, "%Y-%m-%d")
+        except:
+            dt = date_taken  # fallback to string if invalid
+
+        fname, _, _, _ = gen_compact_filename(
+            species=self.species_var.get(),
+            date_taken=dt,
+            feat=self.feature_var.get(),
+            loc=self.loc_var.get(),
+            used_topaz=bool(self.topaz_var.get()),
+            original_name=os.path.basename(self.proc_path_var.get())
+        )
+        self.preview_var.set(fname)
+
+
+    def generate_filename_preview(self):
+        """Generate a short, Dewey-like filename for the current entry."""
+
+        # --- Species code ---
+        species = self.species_var.get().strip()
+        if species:
+            parts = species.split()
+            if len(parts) >= 2:
+                species_code = parts[0][0].upper() + parts[1][:2].upper()
+            else:
+                species_code = parts[0][:3].upper()
+        else:
+            species_code = "SPX"
+
+        # --- Feature code ---
+        feature = self.feature_var.get().strip()
+        feature_code = feature[:2].upper() if feature else "FX"
+
+        # --- Location code ---
+        loc = self.loc_var.get().strip()
+        location_code = loc[:3].upper() if loc else "LOC"
+
+        # --- Date code ---
+        date_str = self.date_var.get().strip()
+        try:
+            from datetime import datetime
+            date_code = datetime.strptime(date_str, "%Y-%m-%d").strftime("%y%m%d")
+        except:
+            date_code = "000000"
+
+        # --- Optional sequence number ---
+        seq_num = "01"  # Can later be made dynamic per day
+
+        # --- Combine ---
+        filename = f"{species_code}-{feature_code}-{location_code}-{date_code}-{seq_num}"
+        return filename
+
 
     def save_entry(self):
         """
         Safely saves the current entry to the database.
-        Adds watermark to processed image if enabled.
+        Generates a compact filename, copies the processed image,
+        applies watermark if enabled, and handles raw files.
         """
+        import os
+        import sqlite3
+        from datetime import datetime
+        from shutil import copy2
+
         proc_path = self.proc_path_var.get()
         if not proc_path or not os.path.exists(proc_path):
             messagebox.showerror("Error", "Processed image path is invalid or missing.")
             return
 
-        # --- NEW: Apply watermark if checkbox selected ---
+        # Ensure processed folder exists
+        os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+
+        # Generate compact filename
+        date_taken = self.date_var.get().strip()
+        try:
+            dt = datetime.strptime(date_taken, "%Y-%m-%d")
+        except:
+            dt = date_taken  # fallback to string if invalid
+
+        fname, spec_code, feat_code, loc_code = gen_compact_filename(
+            species=self.species_var.get(),
+            date_taken=dt,
+            feat=self.feature_var.get(),
+            loc=self.loc_var.get(),
+            used_topaz=bool(self.topaz_var.get()),
+            original_name=os.path.basename(proc_path)
+        )
+
+        # Copy processed image to managed folder
+        processed_path = os.path.join(PROCESSED_FOLDER, fname)
+        try:
+            copy2(proc_path, processed_path)
+        except Exception as e:
+            messagebox.showerror("File Copy Error", f"Failed to copy processed image:\n{e}")
+            return
+
+        # Apply watermark only to copied file
         if self.watermark_var.get() == 1:
             try:
-                self.apply_watermark(proc_path)
+                self.apply_watermark(processed_path)
             except Exception as e:
                 messagebox.showerror("Watermark Error", f"Failed to apply watermark:\n{e}")
                 return
 
-        # --- Write entry to DB ---
+        # Prepare raw file paths
+        raw_paths_list = self.raw_listbox.get(0, tk.END)
+        if self.copy_raw_var.get() == 1 and raw_paths_list:
+            # Copy raw files into managed raw folder
+            raw_dest_folder = os.path.join(RAW_FOLDER)
+            os.makedirs(raw_dest_folder, exist_ok=True)
+            copied_raws = []
+            for raw_file in raw_paths_list:
+                try:
+                    dest = os.path.join(raw_dest_folder, os.path.basename(raw_file))
+                    copy2(raw_file, dest)
+                    copied_raws.append(dest)
+                except Exception as e:
+                    messagebox.showwarning("Raw Copy Warning", f"Failed to copy raw file {raw_file}:\n{e}")
+            raw_paths_list = copied_raws  # save copied paths
+        # else raw_paths_list remains original paths if not copying
+
+        # Insert into database
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         try:
@@ -1533,27 +1624,28 @@ class PlantPhotoManager(TkinterDnD.Tk):
                         location, location_code, processed_filename, processed_path,
                         raw_attached, raw_paths, raw_mode, created_at, watermark_enabled)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (self.species_var.get(),
-                    self.species_var.get().upper(),
-                    self.gfib_var.get(),
-                    self.feature_var.get(),
-                    self.feature_var.get().upper(),
-                    self.date_var.get(),
-                    self.topaz_var.get(),
-                    self.size_var.get(),
-                    self.other_var.get(),
-                    self.loc_var.get(),
-                    self.loc_var.get().upper(),
-                    os.path.basename(proc_path),
-                    proc_path,
-                    1 if self.raw_listbox.size() > 0 else 0,
-                    ",".join(self.raw_listbox.get(0, tk.END)),
-                    "copy" if self.copy_raw_var.get() else "link",
-                    datetime.now().isoformat(),
-                    self.watermark_var.get()
+                    (
+                        self.species_var.get(),
+                        spec_code,
+                        self.gfib_var.get(),
+                        self.feature_var.get(),
+                        feat_code,
+                        self.date_var.get(),
+                        self.topaz_var.get(),
+                        self.size_var.get(),
+                        self.other_var.get(),
+                        self.loc_var.get(),
+                        loc_code,
+                        fname,
+                        processed_path,
+                        1 if raw_paths_list else 0,
+                        ",".join(raw_paths_list),
+                        "copy" if self.copy_raw_var.get() else "link",
+                        datetime.now().isoformat(),
+                        self.watermark_var.get()
                     ))
             conn.commit()
-            messagebox.showinfo("Success", "Entry saved successfully!")
+            messagebox.showinfo("Success", f"Entry saved successfully!\nFilename: {fname}")
         except Exception as e:
             messagebox.showerror("Database Error", f"Failed to save entry:\n{e}")
         finally:
@@ -1572,7 +1664,7 @@ class PlantPhotoManager(TkinterDnD.Tk):
         self.copy_raw_var.set(1)
 
     def apply_watermark(self, image_path):
-        """Draws the copyright watermark onto the processed image."""
+        """Applies copyright watermark ONLY to the copied/renamed file."""
         from PIL import Image, ImageDraw, ImageFont
 
         img = Image.open(image_path).convert("RGBA")
@@ -1580,35 +1672,41 @@ class PlantPhotoManager(TkinterDnD.Tk):
 
         text = "© 2025 Isaac Kriegsman  •  KriegsmanArts.com\nAll rights reserved."
 
-        # Pick font size based on image height
+        # Scale font based on image height
         font_size = max(18, img.height // 45)
         try:
             font = ImageFont.truetype("arial.ttf", font_size)
         except:
             font = ImageFont.load_default()
 
-        # Measure text
-        w, h = draw.multiline_textsize(text, font=font)
+        # Compute text bounding box
+        bbox = draw.multiline_textbbox((0, 0), text, font=font)
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
 
-        # Padding
         pad = 10
-        box = (pad, img.height - h - pad * 2)
+        x = pad
+        y = img.height - h - pad * 2
 
-        # White rectangle
+        # White box background
         draw.rectangle(
-            [box[0], box[1], box[0] + w + pad * 2, box[1] + h + pad * 2],
+            [x - 5, y - 5, x + w + pad * 2, y + h + pad * 2],
             fill="white"
         )
 
-        # Black text
-        draw.multiline_text(
-            (box[0] + pad, box[1] + pad),
-            text,
-            fill="black",
-            font=font
-        )
+        # Draw text
+        draw.multiline_text((x + pad, y + pad), text, fill="black", font=font)
 
-        img.save(image_path)
+        # --- Save safely depending on format ---
+        ext = os.path.splitext(image_path)[1].lower()
+
+        if ext in [".jpg", ".jpeg"]:
+            # JPEG cannot store alpha → convert, apply quality
+            img.convert("RGB").save(image_path, quality=95)
+        else:
+            # PNG, TIFF, etc.
+            img.save(image_path)
+
 
 
 
