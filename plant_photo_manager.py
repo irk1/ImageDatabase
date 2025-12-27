@@ -8,7 +8,7 @@ Dependencies:
 """
 
 import os
-import shutil
+from shutil import copy2
 import sqlite3
 import hashlib
 import csv
@@ -26,11 +26,28 @@ from tkinterdnd2 import TkinterDnD
 # -------------------------
 # Configuration / Folders
 # -------------------------
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-PROCESSED_DIR = os.path.join(APP_DIR, "processed")
-RAW_DIR = os.path.join(APP_DIR, "raw")
+# -------------------------
+# Configuration / Folders
+# -------------------------
+
+# Default database file (if DB_FILE not defined elsewhere)
+DEFAULT_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plant_photos.db")
+if 'DB_FILE' not in globals():
+    DB_FILE = DEFAULT_DB_FILE
+
+# Base folder relative to database location
+BASE_DIR = os.path.dirname(os.path.abspath(DB_FILE))
+
+# Processed and raw folders relative to DB_FILE
+PROCESSED_DIR = os.path.join(BASE_DIR, "processed")
+RAW_DIR = os.path.join(BASE_DIR, "raw")
+
+# Thumbnail size
 THUMB_SIZE = (320, 240)
-Image.MAX_IMAGE_PIXELS = 1000000000   # Allow up to 1 billion pixels
+
+# Allow very large images (up to 1 billion pixels)
+Image.MAX_IMAGE_PIXELS = 1000000000
+
 
 # -------------------------
 # Utility functions
@@ -62,7 +79,7 @@ def gen_compact_filename(species, date_taken, feat=None, loc=None, used_topaz=Fa
     topaz_tag = "_T" if used_topaz else ""
     orig_tag = f"_{original_name}" if original_name else ""
     
-    fname = f"{spec_code}{feat_code}{locc}_{date_str}{topaz_tag}{orig_tag}"
+    fname = f"{spec_code}{feat_code}{locc}_{date_str}{topaz_tag}"
 
     return fname, spec_code, feat_code, locc
 
@@ -91,7 +108,8 @@ def open_path(path):
 # -------------------------
 
 
-DEFAULT_DB_FILE = os.path.join(APP_DIR, "plant_photos.db")
+
+
 
 def select_or_create_db():
     """Prompt once for a database file, or create default if none chosen."""
@@ -125,7 +143,7 @@ def init_db_at(db_path):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             species TEXT,
             species_code TEXT,
-            gfib_link TEXT,
+            gbif_link TEXT,
             main_feature TEXT,
             feature_code TEXT,
             date_taken TEXT,
@@ -184,7 +202,7 @@ def init_db_if_missing(db_path):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             species TEXT,
             species_code TEXT,
-            gfib_link TEXT,
+            gbif_link TEXT,
             main_feature TEXT,
             feature_code TEXT,
             date_taken TEXT,
@@ -327,7 +345,7 @@ def ensure_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             species TEXT,
             species_code TEXT,
-            gfib_link TEXT,
+            gbif_link TEXT,
             main_feature TEXT,
             feature_code TEXT,
             date_taken TEXT,
@@ -377,21 +395,21 @@ def ensure_db():
     conn.close()
 
 
-
 # --- One-time setup before GUI ---
 DB_FILE = select_or_create_db()
 ensure_db()
 db_file = DB_FILE
-# Ensure database exists and has proper schema
 init_db_if_missing(DB_FILE)
 
-# Make sure working folders exist
-os.makedirs(PROCESSED_DIR, exist_ok=True)
-os.makedirs(RAW_DIR, exist_ok=True)
+# Recompute base and storage folders based on the actual DB selected by the user.
+# This ensures `PROCESSED_DIR` and `RAW_DIR` live beside the chosen DB file,
+# rather than next to the script when a different DB is chosen at runtime.
+BASE_DIR = os.path.dirname(os.path.abspath(DB_FILE))
+PROCESSED_DIR = os.path.join(BASE_DIR, "processed")
+RAW_DIR = os.path.join(BASE_DIR, "raw")
 
 # Prepare empty mappings (will load in GUI)
 FEATURE_MAP, LOCATION_MAP = {}, {}
-
 
 
 # -------------------------
@@ -627,7 +645,7 @@ class PlantPhotoManager(TkinterDnD.Tk):
             row += 2
 
         mk_entry("Species (Genus species)", "species_var")
-        mk_entry("Link to GFIB (optional)", "gfib_var", autocomplete=False)
+        mk_entry("Link to GBIF (optional)", "gbif_var", autocomplete=False)
         mk_entry("Main feature (flower, leaf...)", "feature_var")
         mk_entry("Date taken (YYYY-MM-DD)", "date_var", autocomplete=False)
         mk_entry("Subject size (macro/small/med/large)", "size_var")
@@ -1546,50 +1564,59 @@ class PlantPhotoManager(TkinterDnD.Tk):
         return filename
 
 
+    from shutil import copy2
+    from datetime import datetime
+    import os
+    import sqlite3
+    from tkinter import messagebox
+
     def save_entry(self):
         """
         Safely saves the current entry to the database.
         Generates a compact filename, copies the processed image,
         applies watermark if enabled, and handles raw files.
+        Ensures processed and raw folders exist next to the DB.
         """
-        import os
-        import sqlite3
-        from datetime import datetime
-        from shutil import copy2
-
         proc_path = self.proc_path_var.get()
         if not proc_path or not os.path.exists(proc_path):
             messagebox.showerror("Error", "Processed image path is invalid or missing.")
             return
 
-        # Ensure processed folder exists
-        os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+        # --- Determine directories relative to DB ---
+        db_dir = os.path.dirname(os.path.abspath(DB_FILE))
+        processed_dir = os.path.join(db_dir, "processed")
+        raw_dir = os.path.join(db_dir, "raw")
+        os.makedirs(processed_dir, exist_ok=True)
+        os.makedirs(raw_dir, exist_ok=True)
 
-        # Generate compact filename
-        date_taken = self.date_var.get().strip()
-        try:
-            dt = datetime.strptime(date_taken, "%Y-%m-%d")
-        except:
-            dt = date_taken  # fallback to string if invalid
+        # --- Get date_taken (can be empty) ---
+        date_taken = self.date_var.get().strip() or None
 
-        fname, spec_code, feat_code, loc_code = gen_compact_filename(
+        # --- Get original file extension ---
+        orig_ext = os.path.splitext(proc_path)[1]  # includes the dot, e.g., ".tif"
+
+        # --- Generate compact filename WITHOUT original name ---
+        fname_base, spec_code, feat_code, loc_code = gen_compact_filename(
             species=self.species_var.get(),
-            date_taken=dt,
+            date_taken=date_taken,
             feat=self.feature_var.get(),
             loc=self.loc_var.get(),
             used_topaz=bool(self.topaz_var.get()),
-            original_name=os.path.basename(proc_path)
+            original_name=None
         )
 
-        # Copy processed image to managed folder
-        processed_path = os.path.join(PROCESSED_FOLDER, fname)
+        fname = fname_base + orig_ext
+        processed_path = os.path.join(processed_dir, fname)
+
+        # --- Copy processed image ---
         try:
+            from shutil import copy2
             copy2(proc_path, processed_path)
         except Exception as e:
             messagebox.showerror("File Copy Error", f"Failed to copy processed image:\n{e}")
             return
 
-        # Apply watermark only to copied file
+        # --- Apply watermark only to copied file ---
         if self.watermark_var.get() == 1:
             try:
                 self.apply_watermark(processed_path)
@@ -1597,29 +1624,27 @@ class PlantPhotoManager(TkinterDnD.Tk):
                 messagebox.showerror("Watermark Error", f"Failed to apply watermark:\n{e}")
                 return
 
-        # Prepare raw file paths
+        # --- Handle raw files ---
         raw_paths_list = self.raw_listbox.get(0, tk.END)
         if self.copy_raw_var.get() == 1 and raw_paths_list:
-            # Copy raw files into managed raw folder
-            raw_dest_folder = os.path.join(RAW_FOLDER)
-            os.makedirs(raw_dest_folder, exist_ok=True)
             copied_raws = []
             for raw_file in raw_paths_list:
                 try:
-                    dest = os.path.join(raw_dest_folder, os.path.basename(raw_file))
+                    dest = os.path.join(raw_dir, os.path.basename(raw_file))
                     copy2(raw_file, dest)
                     copied_raws.append(dest)
                 except Exception as e:
                     messagebox.showwarning("Raw Copy Warning", f"Failed to copy raw file {raw_file}:\n{e}")
             raw_paths_list = copied_raws  # save copied paths
-        # else raw_paths_list remains original paths if not copying
 
-        # Insert into database
+        # --- Insert into database ---
+        import sqlite3
+        from datetime import datetime
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         try:
             c.execute("""INSERT INTO photos
-                        (species, species_code, gfib_link, main_feature, feature_code,
+                        (species, species_code, gbif_link, main_feature, feature_code,
                         date_taken, used_topaz, subject_size, other_features,
                         location, location_code, processed_filename, processed_path,
                         raw_attached, raw_paths, raw_mode, created_at, watermark_enabled)
@@ -1627,7 +1652,7 @@ class PlantPhotoManager(TkinterDnD.Tk):
                     (
                         self.species_var.get(),
                         spec_code,
-                        self.gfib_var.get(),
+                        self.gbif_var.get(),
                         self.feature_var.get(),
                         feat_code,
                         self.date_var.get(),
@@ -1655,7 +1680,7 @@ class PlantPhotoManager(TkinterDnD.Tk):
         self.proc_path_var.set("")
         self.raw_listbox.delete(0, 'end')
         self.raw_files_text.delete("1.0", "end")
-        for var in ("species_var", "gfib_var", "feature_var", "date_var", "size_var", "other_var", "loc_var"):
+        for var in ("species_var", "gbif_var", "feature_var", "date_var", "size_var", "other_var", "loc_var"):
             getattr(self, var).set("")
         self.topaz_var.set(0)
         self.preview_var.set("")
@@ -1820,46 +1845,19 @@ class PlantPhotoManager(TkinterDnD.Tk):
             self.res_tree.insert("", "end", values=r)
 
     def open_selected_processed(self, event=None):
-        sel = self.res_tree.selection()
-        if not sel:
-            return
-        item = self.res_tree.item(sel[0])["values"]
-        if not item:
-            return
-        pk = item[0]
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT processed_path FROM photos WHERE id=?", (pk,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            open_path(row[0])
+        """Open the folder containing processed images relative to the DB."""
+        if os.path.exists(PROCESSED_DIR):
+            open_path(PROCESSED_DIR)
+        else:
+            messagebox.showinfo("Folder Missing", f"Processed folder not found at:\n{PROCESSED_DIR}")
+
 
     def open_selected_raw_folder(self):
-        sel = self.res_tree.selection()
-        if not sel:
-            return
-        item = self.res_tree.item(sel[0])["values"]
-        if not item:
-            return
-        pk = item[0]
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT raw_paths, raw_mode FROM photos WHERE id=?", (pk,))
-        row = c.fetchone()
-        conn.close()
-        if not row or not row[0]:
-            messagebox.showinfo("No raw files", "No raw files attached for this entry.")
-            return
-        raw_paths = row[0].split("|")
-        raw_mode = row[1] if row[1] else "referenced"
-        if raw_mode == "copied":
-            # open the folder containing the first raw copy
-            folder = os.path.dirname(raw_paths[0])
-            open_path(folder)
+        """Open the folder containing raw files relative to the DB."""
+        if os.path.exists(RAW_DIR):
+            open_path(RAW_DIR)
         else:
-            # referenced: open the first raw file directly
-            open_path(raw_paths[0])
+            messagebox.showinfo("Folder Missing", f"Raw folder not found at:\n{RAW_DIR}")
 
     def export_search_csv(self):
         sel_rows = self.res_tree.get_children()
@@ -2016,3 +2014,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
