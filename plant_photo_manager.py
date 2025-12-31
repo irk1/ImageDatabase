@@ -394,6 +394,11 @@ def ensure_db():
     conn.commit()
     conn.close()
 
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and PyInstaller"""
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
 
 # --- One-time setup before GUI ---
 DB_FILE = select_or_create_db()
@@ -419,7 +424,11 @@ class PlantPhotoManager(TkinterDnD.Tk):
     def __init__(self, db_file):
         print("[DEBUG] Initializing PlantPhotoManager...")
         super().__init__()
-
+        #  SET WINDOW ICON HERE
+        try:
+            self.iconbitmap(resource_path("Icon.ico"))
+        except Exception as e:
+            print("[DEBUG] Icon load failed:", e)
         # Assign database file
         self.db_file = db_file
         init_db_if_missing(self.db_file)
@@ -427,12 +436,17 @@ class PlantPhotoManager(TkinterDnD.Tk):
         self.conn = sqlite3.connect(self.db_file)
         self.conn.row_factory = sqlite3.Row  # optional: access rows by column name
 
-        # Set up main window
+        # -------------------------------
+        # Window setup
+        # -------------------------------
         self.title("Plant Photo Manager")
         self.geometry("1050x700")
         self.minsize(950, 620)
 
+       
+        # -------------------------------
         # Setup empty maps; will load immediately
+        # -------------------------------
         global FEATURE_MAP, LOCATION_MAP
         FEATURE_MAP = {}
         LOCATION_MAP = {}
@@ -448,6 +462,7 @@ class PlantPhotoManager(TkinterDnD.Tk):
         print("[DEBUG] Starting GUI widget setup...")
         self.setup_widgets()  # Only call once
         print("[DEBUG] Finished setup_widgets()")
+
     # -------------------------
     # Fetch previous values for autocomplete
     # -------------------------
