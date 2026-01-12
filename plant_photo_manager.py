@@ -410,17 +410,40 @@ init_db_if_missing(DB_FILE)
 # This ensures `PROCESSED_DIR` and `RAW_DIR` live beside the chosen DB file,
 # rather than next to the script when a different DB is chosen at runtime.
 BASE_DIR = os.path.dirname(os.path.abspath(DB_FILE))
-PROCESSED_DIR = os.path.join(BASE_DIR, "processed")
-RAW_DIR = os.path.join(BASE_DIR, "raw")
+PROCESSED_DIR = os.path.join(BASE_DIR, "processed_images")
+RAW_DIR = os.path.join(BASE_DIR, "raw_files")
 
 # Prepare empty mappings (will load in GUI)
 FEATURE_MAP, LOCATION_MAP = {}, {}
+
+def get_feature_and_descendants(conn, feature_name):
+    """
+    Returns a list of feature names including the given feature
+    and all of its descendants.
+    """
+    sql = """
+    WITH RECURSIVE feature_tree AS (
+        SELECT id, name
+        FROM feature_mappings
+        WHERE name = ?
+
+        UNION ALL
+
+        SELECT f.id, f.name
+        FROM feature_mappings f
+        JOIN feature_tree ft ON f.parent_id = ft.id
+    )
+    SELECT name FROM feature_tree;
+    """
+    cur = conn.execute(sql, (feature_name,))
+    return [row["name"] for row in cur.fetchall()]
 
 
 # -------------------------
 # GUI Application
 # -------------------------
 class PlantPhotoManager(TkinterDnD.Tk):
+
     def __init__(self, db_file):
         print("[DEBUG] Initializing PlantPhotoManager...")
         super().__init__()
@@ -492,7 +515,82 @@ class PlantPhotoManager(TkinterDnD.Tk):
         except Exception:
             return []
 
-    
+    def load_selected_entry(self, event=None):
+        sel = self.edit_results_list.curselection()
+        if not sel:
+            return
+
+        entry_text = self.edit_results_list.get(sel[0])
+        pk = entry_text.split("|")[0].strip()
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT * FROM photos WHERE id=?", (pk,))
+        row = c.fetchone()
+        conn.close()
+
+        if not row:
+            return
+
+        # Populate edit fields (adjust names to match your vars)
+        self.edit_species_var.set(row["species"])
+        self.edit_date_var.set(row["date_taken"] or "")
+        self.edit_feature_var.set(row["main_feature"] or "")
+
+    def add_feature_to_hierarchy(self, feature_name: str, parent_id: int = None):
+        """
+        Ensure a feature_name exists in feature_mappings. Return its id.
+        Inserts as top-level (parent_id NULL) if parent_id is None.
+        """
+        if not feature_name:
+            return None
+        feature_name = feature_name.strip()
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT id FROM feature_mappings WHERE feature_name = ? COLLATE NOCASE", (feature_name,))
+        row = c.fetchone()
+        if row:
+            fid = row[0]
+            conn.close()
+            return fid
+        c.execute("INSERT INTO feature_mappings (feature_name, parent_id) VALUES (?, ?)",
+                (feature_name, parent_id))
+        fid = c.lastrowid
+        conn.commit()
+        conn.close()
+        # attempt to update GUI tree (safe if method exists)
+        try:
+            self.refresh_feature_tree()
+        except Exception:
+            pass
+        return fid
+
+    def add_location_to_hierarchy(self, location_name: str, parent_id: int = None):
+        """
+        Ensure a location exists in location_mappings. Return its id.
+        """
+        if not location_name:
+            return None
+        location_name = location_name.strip()
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT id FROM location_mappings WHERE location_name = ? COLLATE NOCASE", (location_name,))
+        row = c.fetchone()
+        if row:
+            lid = row[0]
+            conn.close()
+            return lid
+        c.execute("INSERT INTO location_mappings (location_name, parent_id) VALUES (?, ?)",
+                (location_name, parent_id))
+        lid = c.lastrowid
+        conn.commit()
+        conn.close()
+        try:
+            self.refresh_location_treeview()
+        except Exception:
+            pass
+        return lid
+
     def load_location_mappings(db_file):
         """Load hierarchical location mappings into a dictionary."""
         conn = sqlite3.connect(db_file)
@@ -1350,6 +1448,7 @@ class PlantPhotoManager(TkinterDnD.Tk):
 
         species = self.edit_species_var.get().strip()
         date_taken = self.edit_date_var.get().strip()
+        feature = self.edit_feature_var.get().strip()  # 🔹 NEW
 
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -1360,47 +1459,27 @@ class PlantPhotoManager(TkinterDnD.Tk):
         if species:
             query += " AND species LIKE ?"
             params.append(f"%{species}%")
+
         if date_taken:
             query += " AND date_taken LIKE ?"
             params.append(f"%{date_taken}%")
+
+        if feature:
+            features = get_feature_and_descendants(conn, feature)
+
+            placeholders = ",".join("?" for _ in features)
+            query += f" AND main_feature IN ({placeholders})"
+            params.extend(features)
 
         c.execute(query, params)
         rows = c.fetchall()
         conn.close()
 
         for row in rows:
-            self.edit_results_list.insert(tk.END, f"{row[0]} | {row[1]} | {row[2]}")
-
-    def load_selected_entry(self, event):
-        """Load the selected entry's metadata into the editable fields."""
-        selection = self.edit_results_list.curselection()
-        if not selection:
-            return
-
-        entry_text = self.edit_results_list.get(selection[0])
-        entry_id = int(entry_text.split("|")[0].strip())
-
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM photos WHERE id=?", (entry_id,))
-        row = c.fetchone()
-        conn.close()
-
-        if row:
-            # Map columns to fields
-            self.edit_species_entry.delete(0, tk.END)
-            self.edit_species_entry.insert(0, row[1])
-            self.edit_feature_entry.delete(0, tk.END)
-            self.edit_feature_entry.insert(0, row[4])
-            self.edit_location_entry.delete(0, tk.END)
-            self.edit_location_entry.insert(0, row[10])
-            self.edit_date_entry.delete(0, tk.END)
-            self.edit_date_entry.insert(0, row[6])
-            self.edit_topaz_var.set(bool(row[7]))
-            self.edit_raw_var.set(row[15] or "")
-            self.edit_processed_var.set(row[12] or "")
-
-            self.current_edit_id = entry_id  # store which entry we are editing
+            self.edit_results_list.insert(
+                tk.END,
+                f"{row[0]} | {row[1]} | {row[2]}"
+            )
 
     def browse_edit_raw(self):
         """Select new raw files for the entry."""
@@ -1540,6 +1619,51 @@ class PlantPhotoManager(TkinterDnD.Tk):
         )
         self.preview_var.set(fname)
 
+    def get_descendant_feature_names(self, term: str):
+        """
+        Return a list of feature_name strings matching `term` and all their descendants.
+        If `term` is empty, returns [].
+        Uses a recursive CTE to collect children.
+        """
+        if not term:
+            return []
+        term = term.strip()
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        # match by LIKE to allow partial searches (case-insensitive)
+        c.execute("""
+            WITH RECURSIVE descendants(id, feature_name) AS (
+                SELECT id, feature_name FROM feature_mappings WHERE feature_name LIKE ? COLLATE NOCASE
+                UNION ALL
+                SELECT fm.id, fm.feature_name FROM feature_mappings fm
+                JOIN descendants d ON fm.parent_id = d.id
+            )
+            SELECT DISTINCT feature_name FROM descendants
+        """, (f"%{term}%",))
+        rows = [r[0] for r in c.fetchall()]
+        conn.close()
+        return rows
+
+    def get_descendant_location_names(self, term: str):
+        """Same as above but for locations (returns location_name strings)."""
+        if not term:
+            return []
+        term = term.strip()
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("""
+            WITH RECURSIVE descendants(id, location_name) AS (
+                SELECT id, location_name FROM location_mappings WHERE location_name LIKE ? COLLATE NOCASE
+                UNION ALL
+                SELECT lm.id, lm.location_name FROM location_mappings lm
+                JOIN descendants d ON lm.parent_id = d.id
+            )
+            SELECT DISTINCT location_name FROM descendants
+        """, (f"%{term}%",))
+        rows = [r[0] for r in c.fetchall()]
+        conn.close()
+        return rows
+
 
     def generate_filename_preview(self):
         """Generate a short, Dewey-like filename for the current entry."""
@@ -1588,29 +1712,26 @@ class PlantPhotoManager(TkinterDnD.Tk):
     def save_entry(self):
         """
         Safely saves the current entry to the database.
-        Generates a compact filename, copies the processed image,
-        applies watermark if enabled, and handles raw files.
-        Ensures processed and raw folders exist next to the DB.
+        Ensures feature/location exist in mapping tables, copies files, applies watermark,
+        and writes the DB row.
         """
         proc_path = self.proc_path_var.get()
         if not proc_path or not os.path.exists(proc_path):
             messagebox.showerror("Error", "Processed image path is invalid or missing.")
             return
 
-        # --- Determine directories relative to DB ---
-        db_dir = os.path.dirname(os.path.abspath(DB_FILE))
-        processed_dir = os.path.join(db_dir, "processed")
-        raw_dir = os.path.join(db_dir, "raw")
+        # Ensure processed and raw dirs exist relative to DB
+        db_dir = os.path.dirname(os.path.abspath(self.db_file))
+        processed_dir = os.path.join(db_dir, "processed_images")
+        raw_dir = os.path.join(db_dir, "raw_files")
         os.makedirs(processed_dir, exist_ok=True)
         os.makedirs(raw_dir, exist_ok=True)
 
-        # --- Get date_taken (can be empty) ---
+        # Get date (may be empty)
         date_taken = self.date_var.get().strip() or None
 
-        # --- Get original file extension ---
-        orig_ext = os.path.splitext(proc_path)[1]  # includes the dot, e.g., ".tif"
-
-        # --- Generate compact filename WITHOUT original name ---
+        # Build compact filename preserving original extension
+        orig_ext = os.path.splitext(proc_path)[1] or ""
         fname_base, spec_code, feat_code, loc_code = gen_compact_filename(
             species=self.species_var.get(),
             date_taken=date_taken,
@@ -1619,11 +1740,10 @@ class PlantPhotoManager(TkinterDnD.Tk):
             used_topaz=bool(self.topaz_var.get()),
             original_name=None
         )
-
         fname = fname_base + orig_ext
         processed_path = os.path.join(processed_dir, fname)
 
-        # --- Copy processed image ---
+        # Copy processed image into managed folder
         try:
             from shutil import copy2
             copy2(proc_path, processed_path)
@@ -1631,31 +1751,43 @@ class PlantPhotoManager(TkinterDnD.Tk):
             messagebox.showerror("File Copy Error", f"Failed to copy processed image:\n{e}")
             return
 
-        # --- Apply watermark only to copied file ---
-        if self.watermark_var.get() == 1:
+        # Ensure feature & location exist in mapping tables (automatic insertion)
+        feature_name = self.feature_var.get().strip()
+        location_name = self.loc_var.get().strip()
+        try:
+            if feature_name:
+                self.add_feature_to_hierarchy(feature_name)
+            if location_name:
+                self.add_location_to_hierarchy(location_name)
+        except Exception as e:
+            # non-fatal: warn but continue
+            print("Warning: failed to ensure mappings:", e)
+
+        # Apply watermark only to copied file if requested
+        if getattr(self, "watermark_var", None) and self.watermark_var.get() == 1:
             try:
                 self.apply_watermark(processed_path)
             except Exception as e:
                 messagebox.showerror("Watermark Error", f"Failed to apply watermark:\n{e}")
                 return
 
-        # --- Handle raw files ---
-        raw_paths_list = self.raw_listbox.get(0, tk.END)
+        # Handle raw files copying if chosen
+        raw_paths_list = list(self.raw_listbox.get(0, tk.END))
+        saved_raw_paths = []
         if self.copy_raw_var.get() == 1 and raw_paths_list:
-            copied_raws = []
             for raw_file in raw_paths_list:
                 try:
                     dest = os.path.join(raw_dir, os.path.basename(raw_file))
                     copy2(raw_file, dest)
-                    copied_raws.append(dest)
+                    saved_raw_paths.append(dest)
                 except Exception as e:
                     messagebox.showwarning("Raw Copy Warning", f"Failed to copy raw file {raw_file}:\n{e}")
-            raw_paths_list = copied_raws  # save copied paths
+        else:
+            # keep original referenced raw paths
+            saved_raw_paths = raw_paths_list
 
-        # --- Insert into database ---
-        import sqlite3
-        from datetime import datetime
-        conn = sqlite3.connect(DB_FILE)
+        # Insert into DB
+        conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
         try:
             c.execute("""INSERT INTO photos
@@ -1667,22 +1799,22 @@ class PlantPhotoManager(TkinterDnD.Tk):
                     (
                         self.species_var.get(),
                         spec_code,
-                        self.gbif_var.get(),
-                        self.feature_var.get(),
+                        getattr(self, "gfib_var", tk.StringVar()).get(),
+                        feature_name,
                         feat_code,
                         self.date_var.get(),
-                        self.topaz_var.get(),
+                        int(self.topaz_var.get()),
                         self.size_var.get(),
                         self.other_var.get(),
-                        self.loc_var.get(),
+                        location_name,
                         loc_code,
                         fname,
                         processed_path,
-                        1 if raw_paths_list else 0,
-                        ",".join(raw_paths_list),
+                        1 if saved_raw_paths else 0,
+                        ",".join(saved_raw_paths),
                         "copy" if self.copy_raw_var.get() else "link",
                         datetime.now().isoformat(),
-                        self.watermark_var.get()
+                        int(getattr(self, "watermark_var", tk.IntVar(value=0)).get())
                     ))
             conn.commit()
             messagebox.showinfo("Success", f"Entry saved successfully!\nFilename: {fname}")
@@ -1710,7 +1842,7 @@ class PlantPhotoManager(TkinterDnD.Tk):
         img = Image.open(image_path).convert("RGBA")
         draw = ImageDraw.Draw(img)
 
-        text = "© 2025 Isaac Kriegsman  •  KriegsmanArts.com\nAll rights reserved."
+        text = "© 2026 Isaac Kriegsman  •  KriegsmanArts.com\nAll rights reserved."
 
         # Scale font based on image height
         font_size = max(18, img.height // 45)
@@ -1747,14 +1879,9 @@ class PlantPhotoManager(TkinterDnD.Tk):
             # PNG, TIFF, etc.
             img.save(image_path)
 
-
-
-
-
-    
-# ---------------------
-# Search Tab
-# ---------------------
+    # ---------------------
+    # Search Tab
+    # ---------------------
     def build_search_tab(self):
         frm = self.search_frame
         topfrm = ttk.Frame(frm, padding=8)
@@ -1767,11 +1894,15 @@ class PlantPhotoManager(TkinterDnD.Tk):
         # Filters
         ttk.Label(topfrm, text="Species:").grid(row=0, column=0, sticky="w")
         self.s_search = tk.StringVar()
-        ttk.Entry(topfrm, textvariable=self.s_search, width=20).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Entry(topfrm, textvariable=self.s_search, width=18).grid(row=0, column=1, sticky="w", padx=4)
 
         ttk.Label(topfrm, text="Feature:").grid(row=0, column=2, sticky="w")
         self.f_search = tk.StringVar()
-        ttk.Entry(topfrm, textvariable=self.f_search, width=20).grid(row=0, column=3, sticky="w", padx=4)
+        ttk.Entry(topfrm, textvariable=self.f_search, width=18).grid(row=0, column=3, sticky="w", padx=4)
+
+        ttk.Label(topfrm, text="Location:").grid(row=0, column=4, sticky="w")
+        self.loc_search = tk.StringVar()
+        ttk.Entry(topfrm, textvariable=self.loc_search, width=18).grid(row=0, column=5, sticky="w", padx=4)
 
         ttk.Label(topfrm, text="Date from (YYYY-MM-DD):").grid(row=1, column=0, sticky="w", pady=6)
         self.date_from = tk.StringVar()
@@ -1781,19 +1912,19 @@ class PlantPhotoManager(TkinterDnD.Tk):
         ttk.Entry(topfrm, textvariable=self.date_to, width=12).grid(row=1, column=3, sticky="w", padx=4)
 
         self.topaz_search_var = tk.IntVar(value=0)
-        ttk.Checkbutton(topfrm, text="Topaz only", variable=self.topaz_search_var).grid(row=0, column=4, padx=12)
+        ttk.Checkbutton(topfrm, text="Topaz only", variable=self.topaz_search_var).grid(row=0, column=6, padx=12)
 
         ttk.Label(topfrm, text="Free text (other features):").grid(row=1, column=4, sticky="w")
         self.free_text = tk.StringVar()
         ttk.Entry(topfrm, textvariable=self.free_text, width=30).grid(row=1, column=5, sticky="w", padx=4)
 
-        ttk.Button(topfrm, text="Search", command=self.populate_search_results).grid(row=0, column=6, padx=6)
-        ttk.Button(topfrm, text="Reset", command=self.reset_search).grid(row=1, column=6, padx=6)
+        ttk.Button(topfrm, text="Search", command=self.populate_search_results).grid(row=0, column=7, padx=6)
+        ttk.Button(topfrm, text="Reset", command=self.reset_search).grid(row=1, column=7, padx=6)
 
         # Results Treeview
         cols = ("id", "species", "date_taken", "main_feature", "used_topaz", "processed_filename", "raw_attached", "raw_mode")
         self.res_tree = ttk.Treeview(midfrm, columns=cols, show="headings", selectmode="browse")
-        widths = {"id":60, "species":160, "date_taken":100, "main_feature":120, "used_topaz":80, "processed_filename":260, "raw_attached":100, "raw_mode":100}
+        widths = {"id":60, "species":160, "date_taken":100, "main_feature":140, "used_topaz":80, "processed_filename":260, "raw_attached":100, "raw_mode":100}
         for c in cols:
             self.res_tree.heading(c, text=c.replace("_", " ").title())
             self.res_tree.column(c, width=widths.get(c, 120), anchor="w")
@@ -1818,39 +1949,67 @@ class PlantPhotoManager(TkinterDnD.Tk):
         self.populate_search_results()
 
     def populate_search_results(self):
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
-        query = "SELECT id, species, date_taken, main_feature, used_topaz, processed_filename, raw_attached, raw_mode FROM photos WHERE 1=1"
+
+        base_query = "SELECT id, species, date_taken, main_feature, used_topaz, processed_filename, raw_attached, raw_mode FROM photos WHERE 1=1"
         params = []
+
+        # Species
         if self.s_search.get().strip():
-            query += " AND species LIKE ?"
+            base_query += " AND species LIKE ?"
             params.append(f"%{self.s_search.get().strip()}%")
+
+        # Feature: expand to include descendants
         if self.f_search.get().strip():
-            query += " AND main_feature LIKE ?"
-            params.append(f"%{self.f_search.get().strip()}%")
+            feats = self.get_descendant_feature_names(self.f_search.get().strip())
+            if feats:
+                placeholders = ",".join("?" for _ in feats)
+                base_query += f" AND main_feature IN ({placeholders})"
+                params.extend(feats)
+            else:
+                base_query += " AND main_feature LIKE ?"
+                params.append(f"%{self.f_search.get().strip()}%")
+
+        # Location: expand to include descendants
+        if getattr(self, "loc_search", None) and self.loc_search.get().strip():
+            locs = self.get_descendant_location_names(self.loc_search.get().strip())
+            if locs:
+                placeholders = ",".join("?" for _ in locs)
+                base_query += f" AND location IN ({placeholders})"
+                params.extend(locs)
+            else:
+                base_query += " AND location LIKE ?"
+                params.append(f"%{self.loc_search.get().strip()}%")
+
+        # Topaz checkbox
         if self.topaz_search_var.get():
-            query += " AND used_topaz = 1"
+            base_query += " AND used_topaz = 1"
+
+        # Free text
         if self.free_text.get().strip():
-            query += " AND other_features LIKE ?"
+            base_query += " AND other_features LIKE ?"
             params.append(f"%{self.free_text.get().strip()}%")
+
+        # Date range
         df = self.date_from.get().strip()
         dt = self.date_to.get().strip()
         if df:
             try:
                 datetime.datetime.strptime(df, "%Y-%m-%d")
-                query += " AND date(date_taken) >= date(?)"
+                base_query += " AND date(date_taken) >= date(?)"
                 params.append(df)
             except Exception:
                 pass
         if dt:
             try:
                 datetime.datetime.strptime(dt, "%Y-%m-%d")
-                query += " AND date(date_taken) <= date(?)"
+                base_query += " AND date(date_taken) <= date(?)"
                 params.append(dt)
             except Exception:
                 pass
 
-        c.execute(query, params)
+        c.execute(base_query, params)
         rows = c.fetchall()
         conn.close()
 
@@ -1858,6 +2017,7 @@ class PlantPhotoManager(TkinterDnD.Tk):
             self.res_tree.delete(i)
         for r in rows:
             self.res_tree.insert("", "end", values=r)
+
 
     def open_selected_processed(self, event=None):
         """Open the folder containing processed images relative to the DB."""
